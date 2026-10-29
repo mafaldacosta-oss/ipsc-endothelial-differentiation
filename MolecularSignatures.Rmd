@@ -1,0 +1,841 @@
+---
+title: "Molecular Signatures — Stage-Associated Developmental Modules and Gene Expression Trajectories"
+output:
+  pdf_document:
+        latex_engine: xelatex
+  html_document: default
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(fig.path = "figures/", dev = c("png", "pdf"), dpi = 300)
+```
+
+```{r libraries, message=FALSE}
+# Load required libraries
+library(readxl)     # read Excel files
+library(dplyr)      # data manipulation
+library(tidyr)      # reshaping data (separate_rows)
+library(writexl)    # export to Excel
+library(stringr)    # string manipulation
+library(ggplot2) 
+```
+
+```{r setup_dir}
+# Set working directory — all input/output files are read/written here
+setwd("~/Desktop/Tese/R/Transcriptomic analysis")
+```
+
+# 1. Load Curation File and Build Leading-Edge Gene Table
+
+```{r load_curation_file}
+# Load the a priori curated GO term file. Sheet names correspond to the
+# three contrasts. Column header rows differ between sheets (some sheets
+# have a "Parameters:" note row above the real header), hence the
+# different `skip` values — confirmed by inspecting each sheet directly.
+
+curation_eMPC_vs_iPSC <- read_excel(
+  "~/Desktop/Tese/R/GSEA_GO_BP_curated_apriori.xlsx", sheet = "eMPC_vs_iPSC", skip = 2)
+curation_EC_vs_eMPC   <- read_excel(
+  "~/Desktop/Tese/R/GSEA_GO_BP_curated_apriori.xlsx", sheet = "EC_vs_eMPC", skip = 0)
+curation_EC_vs_iPSC   <- read_excel(
+  "~/Desktop/Tese/R/GSEA_GO_BP_curated_apriori.xlsx", sheet = "EC_vs_iPSC", skip = 0)
+
+cat("Columns:", paste(colnames(curation_eMPC_vs_iPSC), collapse = ", "), "\n")
+```
+
+```{r extract_leading_edge}
+# Extract leading edge genes from pathways marked "yes_apriori" in the
+# a priori curation. Returns one row per (pathway, gene) pair, with
+# contrast_side, biological_category, and NES carried along.
+#
+# Columns are renamed by position using base R (not tidyselect helpers
+# like all_of()/.data[[]]) — some column names in the curated file carry
+# hidden characters (e.g. \r\n) that caused unpredictable failures with
+# tidyselect indirection. All dplyr/tidyr calls are namespaced (dplyr::,
+# tidyr::) because another loaded package was silently masking
+# dplyr::rename()/dplyr::filter() in this session.
+
+extract_leadinggene <- function(curation_df, contrast_name) {
+
+  # Column order in GSEA_GO_BP_curated_apriori.xlsx:
+  # 1 = Include in signature? (old, data-driven — not used here)
+  # 2 = include_apriori (new, a priori selection — used here)
+  # 3 = Stage-associated side of contrast
+  # 4 = Biological category
+  # last = leadingEdge
+  n <- ncol(curation_df)
+  colnames(curation_df)[2] <- "include_apriori_std"
+  colnames(curation_df)[3] <- "contrast_side_std"
+  colnames(curation_df)[4] <- "biological_category_std"
+  colnames(curation_df)[n] <- "leadingEdge_std"
+
+  # Stop loudly if the columns aren't what we expect, instead of
+  # silently extracting from the wrong columns
+  stopifnot(colnames(curation_df)[2] == "include_apriori_std")
+
+  selected <- curation_df[
+    !is.na(curation_df$include_apriori_std) &
+    curation_df$include_apriori_std == "yes_apriori", ]
+
+  cat(contrast_name, "— yes_apriori pathways:", nrow(selected), "\n")
+
+  result <- selected %>%
+    dplyr::select(
+      pathway              = pathway,
+      pathway_clean         = pathway_clean,
+      contrast_side         = contrast_side_std,
+      biological_category   = biological_category_std,
+      NES,
+      leadingEdge           = leadingEdge_std
+    ) %>%
+    dplyr::mutate(
+      contrast = contrast_name,
+      leadingEdge = as.character(leadingEdge)
+    ) %>%
+    tidyr::separate_rows(leadingEdge, sep = ",\\s*") %>%
+    dplyr::rename(gene = leadingEdge) %>%
+    dplyr::filter(!is.na(gene), gene != "")
+
+  return(result)
+}
+
+le_eMPC_vs_iPSC <- extract_leadinggene(curation_eMPC_vs_iPSC, "eMPC_vs_iPSC")
+le_EC_vs_eMPC   <- extract_leadinggene(curation_EC_vs_eMPC,   "EC_vs_eMPC")
+le_EC_vs_iPSC   <- extract_leadinggene(curation_EC_vs_iPSC,   "EC_vs_iPSC")
+
+le_all <- dplyr::bind_rows(le_eMPC_vs_iPSC, le_EC_vs_eMPC, le_EC_vs_iPSC)
+
+cat("\nTotal gene-pathway associations extracted:", nrow(le_all), "\n")
+```
+
+# 2. Build Wide-Format logFC/t/padj Table (L1, L2, L3)
+
+```{r load_toptable_wide}
+# Load the full topTable (all genes tested, not just DEGs) for the three
+# contrasts, and reshape into a single wide table: one row per gene, with
+# logFC, t-statistic, and adjusted p-value for each contrast side by side.
+#
+# L1 = eMPC - iPSC  (mesoderm induction step)
+# L2 = EC   - eMPC  (endothelial specification step)
+# L3 = EC   - iPSC  (full trajectory, cumulative)
+#
+# L1 and L2 are the two legs used to classify each gene's trajectory
+# shape below. L3 is kept for QC and as a measure of overall change
+# and statistical evidence across the full trajectory.
+
+d1 <- read_excel("DEGs_full_toptable_three_contrasts.xlsx", sheet = "eMPC_vs_iPSC") %>%
+  dplyr::rename(L1_logFC = logFC, L1_t = t, L1_pval = P.Value, L1_padj = adj.P.Val)
+
+d2 <- read_excel("DEGs_full_toptable_three_contrasts.xlsx", sheet = "EC_vs_eMPC") %>%
+  dplyr::rename(L2_logFC = logFC, L2_t = t, L2_pval = P.Value, L2_padj = adj.P.Val)
+
+d3 <- read_excel("DEGs_full_toptable_three_contrasts.xlsx", sheet = "EC_vs_iPSC") %>%
+  dplyr::rename(L3_logFC = logFC, L3_t = t, L3_pval = P.Value, L3_padj = adj.P.Val)
+
+wide <- d1 %>%
+  dplyr::inner_join(d2, by = "GeneID") %>%
+  dplyr::inner_join(d3, by = "GeneID")
+
+cat("Genes in wide table:", nrow(wide), "\n")
+```
+
+# 3. QC - Confirm L3 ≈ L1 + L2
+
+```{r qc_l3}
+# L3 (EC vs iPSC) should equal L1 + L2 almost exactly, because all three
+# contrasts were extracted via contrasts.fit() from the same lmFit object
+# (same design matrix, same array weights). This is an algebraic identity
+# of the model coefficients, not a biological result — a large deviation
+# here would point to a gene mapping problem, duplicated rows, or a
+# contrast built from a different fit, and should be investigated before
+# trusting anything downstream.
+
+wide <- wide %>%
+  dplyr::mutate(
+    L3_predicted = L1_logFC + L2_logFC,
+    L3_diff      = L3_logFC - L3_predicted
+  )
+
+cat("=== QC: L3 vs L1+L2 ===\n")
+cat("Max absolute deviation:", max(abs(wide$L3_diff)), "\n")
+print(summary(wide$L3_diff))
+
+# Flag any gene with a deviation above floating-point noise (should be none)
+qc_flag <- wide %>% dplyr::filter(abs(L3_diff) > 1e-6)
+cat("\nGenes with L3 deviation > 1e-6:", nrow(qc_flag), "\n")
+if (nrow(qc_flag) > 0) print(qc_flag$GeneID)
+```
+
+# 4. Restrict to Module-Associated Genes
+
+```{r filter_module_genes}
+# Restrict the wide table to the genes already identified as leading-edge
+# members of at least one yes_apriori pathway (le_all, built in Section 1).
+# This is the full module-associated gene set (856 genes) — the official
+# molecular signature. No reduction to "core genes" happens at this stage.
+
+module_genes <- unique(le_all$gene)
+cat("Module genes (from le_all):", length(module_genes), "\n")
+
+wide_modules <- wide %>%
+  dplyr::filter(GeneID %in% module_genes) %>%
+  dplyr::select(GeneID, L1_logFC, L1_t, L1_padj,
+                        L2_logFC, L2_t, L2_padj,
+                        L3_logFC, L3_t, L3_padj)
+
+cat("Module genes matched in topTable:", nrow(wide_modules), "\n")
+cat("Module genes NOT found in topTable:", length(module_genes) - nrow(wide_modules), "\n")
+```
+
+# 5. Classify Gene Trajectories (trajectory_sign_class)
+
+```{r trajectory_sign_class}
+# Classify each gene by the sign of L1 and L2 only — four possible
+# combinations, no magnitude threshold applied at this stage. This is a
+# deliberately conservative first pass: sign alone already separates
+# genuinely different biological stories (transient peak/trough at the
+# eMPC stage vs. progressive monotonic change across the full
+# trajectory), and applying a magnitude cutoff before inspecting the
+# real distribution would risk imposing an arbitrary boundary the data
+# may not support.
+
+wide_modules <- wide_modules %>%
+  dplyr::mutate(trajectory_sign_class = dplyr::case_when(
+    L1_logFC > 0 & L2_logFC > 0 ~ "monotonic_increase",
+    L1_logFC < 0 & L2_logFC < 0 ~ "monotonic_decrease",
+    L1_logFC > 0 & L2_logFC < 0 ~ "eMPC_peak",
+    L1_logFC < 0 & L2_logFC > 0 ~ "eMPC_trough",
+    TRUE ~ "other_zero"
+  ))
+
+cat("=== trajectory_sign_class distribution ===\n")
+print(table(wide_modules$trajectory_sign_class))
+print(round(prop.table(table(wide_modules$trajectory_sign_class)), 3))
+```
+
+# 6. Flag Weak/Near-Flat Transitions
+
+```{r near_flat_flag}
+# Flag genes where at least one leg (L1 or L2) is both small in magnitude
+# (|logFC| < 0.5) AND not statistically significant (padj >= 0.05).
+#
+# This does NOT reclassify the gene or remove it from its
+# trajectory_sign_class — it only marks that one of the two legs behind
+# that label is effectively flat, so the "monotonic" or "peak/trough"
+# story should not be over-interpreted for that specific gene when
+# writing up individual examples.
+
+wide_modules <- wide_modules %>%
+  dplyr::mutate(
+    L1_weak = abs(L1_logFC) < 0.5 & L1_padj >= 0.05,
+    L2_weak = abs(L2_logFC) < 0.5 & L2_padj >= 0.05,
+    near_flat_transition = L1_weak | L2_weak
+  ) %>%
+  dplyr::select(-L1_weak, -L2_weak)
+
+cat("Genes with near_flat_transition = TRUE:",
+    sum(wide_modules$near_flat_transition),
+    sprintf("(%.0f%%)\n", 100 * mean(wide_modules$near_flat_transition)))
+
+cat("\nBy class:\n")
+wide_modules %>%
+  dplyr::group_by(trajectory_sign_class) %>%
+  dplyr::summarise(n = dplyr::n(), n_near_flat = sum(near_flat_transition), .groups = "drop")
+```
+
+# 7. Export Gene Trajectory Table
+
+```{r export_gene_trajectory}
+# Export the final gene-level trajectory table: 856 module-associated
+# genes, with L1/L2/L3 (logFC, t, padj) and the trajectory_sign_class /
+# near_flat_transition annotations. This is the input for the next stage
+# (biological_module annotation and heatmap construction).
+
+write_xlsx(
+  list("gene_trajectory" = wide_modules),
+  path = "gene_trajectory_L1L2L3.xlsx"
+)
+
+cat("Exported gene_trajectory_L1L2L3.xlsx —", nrow(wide_modules), "genes\n")
+```
+
+# 8. Attach Biological Module Annotation
+
+```{r attach_biological_module}
+# For each gene, summarise which biological_category (module) and which
+# pathway(s) it comes from, across all yes_apriori pathways it appears in
+# as a leading-edge member. A gene can belong to more than one module —
+# this is captured as a semicolon-separated list, not collapsed into a
+# single "primary module" here. That reduction (if needed for heatmap
+# row_split) is a separate, later decision — see Section 9.
+
+gene_module_summary <- le_all %>%
+  dplyr::group_by(gene) %>%
+  dplyr::summarise(
+    biological_modules = paste(sort(unique(biological_category)), collapse = "; "),
+    n_modules           = dplyr::n_distinct(biological_category),
+    source_pathways      = paste(sort(unique(pathway_clean)), collapse = "; "),
+    n_pathways           = dplyr::n_distinct(pathway),
+    .groups = "drop"
+  )
+
+cat("Genes summarised:", nrow(gene_module_summary), "\n")
+cat("Genes belonging to more than one module:",
+    sum(gene_module_summary$n_modules > 1),
+    sprintf("(%.0f%%)\n", 100 * mean(gene_module_summary$n_modules > 1)))
+```
+
+```{r join_module_to_trajectory}
+# Join the module annotation onto the gene trajectory table (one row per
+# gene, matching the 856 already confirmed in Section 4/7).
+
+gene_trajectory_annotated <- wide_modules %>%
+  dplyr::left_join(gene_module_summary, by = c("GeneID" = "gene"))
+
+cat("Rows after join:", nrow(gene_trajectory_annotated), "\n")
+cat("Rows with missing module annotation (should be 0):",
+    sum(is.na(gene_trajectory_annotated$biological_modules)), "\n")
+```
+
+```{r export_annotated}
+write_xlsx(
+  list("gene_trajectory_annotated" = gene_trajectory_annotated),
+  path = "gene_trajectory_annotated.xlsx"
+)
+
+cat("Exported gene_trajectory_annotated.xlsx —", nrow(gene_trajectory_annotated), "genes\n")
+```
+
+# 9. Signature Heatmap — 856 Genes × 9 Samples
+
+```{r load_y_and_annotations}
+# Load the voom-normalized expression matrix (y$E) from the backbone
+# pipeline, and the gene-level annotation table built in Sections 1-8
+# (biological module membership, trajectory class).
+
+library(ComplexHeatmap)
+library(circlize)
+library(grid)
+
+y <- readRDS("y_voom_backbone.rds")
+
+cat("Genes in y$E:", nrow(y$E), "| Samples:", ncol(y$E), "\n")
+```
+
+```{r determine_dominant_module}
+# For row_split purposes only (figure layout), assign each gene a single
+# "dominant" module — the biological_category in which it appears as a
+# leading-edge member in the most distinct yes_apriori pathways. This is
+# NOT a claim of exclusive biological membership: genes belonging to more
+# than one module keep their full membership list in the side annotation
+# panel built below. The dominant module only determines which block of
+# the heatmap the gene's row is drawn in.
+
+module_pathway_counts <- le_all %>%
+  dplyr::group_by(gene, biological_category) %>%
+  dplyr::summarise(n_pathways_in_module = dplyr::n_distinct(pathway), .groups = "drop")
+
+dominant_module <- module_pathway_counts %>%
+  dplyr::group_by(gene) %>%
+  dplyr::slice_max(n_pathways_in_module, n = 1, with_ties = FALSE) %>%
+  dplyr::ungroup() %>%
+  dplyr::select(gene, dominant_module = biological_category)
+
+cat("Genes with dominant module assigned:", nrow(dominant_module), "\n")
+```
+
+```{r build_expression_matrix}
+# Subset y$E to the 856 module-associated genes, in the order defined by
+# gene_trajectory_annotated. Genes not present in y$E (e.g. removed by
+# low-expression filtering upstream) are reported and dropped.
+
+genes_use <- gene_trajectory_annotated$GeneID
+genes_use_present <- genes_use[genes_use %in% rownames(y$E)]
+
+cat("Module genes requested:", length(genes_use), "\n")
+cat("Module genes found in y$E:", length(genes_use_present), "\n")
+cat("Module genes missing from y$E (filtered out upstream):",
+    length(genes_use) - length(genes_use_present), "\n")
+
+mat <- y$E[genes_use_present, , drop = FALSE]
+
+# Row z-score (per gene), same convention as the canonical marker heatmap
+mat_z <- t(scale(t(mat)))
+mat_z[is.na(mat_z)] <- 0
+
+# Clean column names to match the canonical marker heatmap convention
+colnames(mat_z) <- c(
+  "iPSC_1", "iPSC_2", "iPSC_3",
+  "eMPC_1", "eMPC_2", "eMPC_3",
+  "EC_1", "EC_2", "EC_3"
+)
+```
+
+```{r build_row_split_and_side_annotation}
+# Row split: dominant module (layout only, see note above)
+row_split <- factor(
+  dominant_module$dominant_module[match(genes_use_present, dominant_module$gene)]
+)
+
+# Side annotation: full module membership (not just dominant), one binary
+# column per module. This is the honest record of every module a gene
+# belongs to — the row_split above only reflects the single strongest one.
+all_modules <- sort(unique(le_all$biological_category))
+
+membership_mat <- sapply(all_modules, function(m) {
+  genes_in_m <- unique(le_all$gene[le_all$biological_category == m])
+  as.integer(genes_use_present %in% genes_in_m)
+})
+rownames(membership_mat) <- genes_use_present
+colnames(membership_mat) <- all_modules
+
+cat("Row split levels:", paste(levels(row_split), collapse = ", "), "\n")
+```
+
+```{r draw_heatmap_full_supplement, fig.width=14, fig.height=40}
+# Supplementary figure: full 856-gene heatmap, all modules, for
+# documentation purposes. Not intended as the main results figure —
+# see Section 10 (module-score heatmap) for that. Row titles are kept
+# small and horizontal to avoid overlap at this many row-split groups.
+
+col_group <- factor(
+  c(rep("iPSC", 3), rep("eMPC", 3), rep("EC", 3)),
+  levels = c("iPSC", "eMPC", "EC")
+)
+
+top_ha <- HeatmapAnnotation(
+  Group = anno_block(
+    gp = gpar(fill = "grey95", col = "grey70"),
+    labels = c("iPSC", "eMPC", "EC"),
+    labels_gp = gpar(fontsize = 11, fontface = "bold", col = "black")
+  ),
+  show_annotation_name = FALSE,
+  height = unit(7, "mm")
+)
+
+col_fun <- colorRamp2(c(-2, 0, 2), c("#2166AC", "white", "#B2182B"))
+
+ht_main <- Heatmap(
+  mat_z,
+  name = "z-score",
+  col = col_fun,
+  column_split = col_group,
+  top_annotation = top_ha,
+  row_split = row_split,
+  cluster_columns = FALSE,
+  cluster_row_slices = FALSE,
+  show_row_names = FALSE,
+  row_title_rot = 0,
+  row_title_gp = gpar(fontsize = 6),
+  row_gap = unit(1, "mm"),
+  column_gap = unit(1, "mm"),
+  border = TRUE
+)
+
+ht_membership <- Heatmap(
+  membership_mat,
+  name = "module\nmembership",
+  col = c("0" = "white", "1" = "grey30"),
+  show_row_names = FALSE,
+  cluster_columns = FALSE,
+  cluster_rows = FALSE,
+  column_names_gp = gpar(fontsize = 6),
+  column_title = "Full module membership",
+  column_title_gp = gpar(fontsize = 9),
+  width = unit(4, "cm")
+)
+
+draw(ht_main + ht_membership,
+     heatmap_legend_side = "right",
+     annotation_legend_side = "right")
+```
+
+# 10. Module-Score Heatmap (Main Figure)
+
+```{r compute_module_scores}
+# For each biological module, compute a per-sample score as the mean
+# z-score across all genes belonging to that module (based on the full
+# membership list from le_all, not the single "dominant module" used
+# only for the row_split layout in Section 9). A gene belonging to more
+# than one module contributes to the score of each — this is expected
+# and not corrected for here; modules that share many genes will show
+# correlated scores as a direct consequence.
+
+# mat_z (genes x 9 samples, row z-scored) already exists from Section 9.
+
+module_gene_list <- split(le_all$gene, le_all$biological_category)
+module_gene_list <- module_gene_list[names(module_gene_list) != "pluripotency / stem cell maintenance"]
+module_gene_list <- lapply(module_gene_list, function(g) intersect(unique(g), rownames(mat_z)))
+
+module_score_mat <- t(sapply(module_gene_list, function(genes) {
+  colMeans(mat_z[genes, , drop = FALSE], na.rm = TRUE)
+}))
+
+cat("Modules:", nrow(module_score_mat), "| Samples:", ncol(module_score_mat), "\n")
+cat("Genes per module (range):", paste(range(sapply(module_gene_list, length)), collapse = "-"), "\n")
+```
+
+```{r draw_module_score_heatmap, fig.width=10, fig.height=6}
+# Display names (American spelling, sentence case) and fixed module order,
+# identical to the a priori GO BP matrix figure (Section 4.5.1) and Section 4.6.
+# Renaming is applied to a copy (module_score_plot) so that module_score_mat
+# keeps the original category names used elsewhere in this Rmd.
+
+module_display_names <- c(
+  "mesoderm development"                            = "Mesoderm development",
+  "embryonic patterning and morphogenesis"          = "Embryonic patterning and morphogenesis",
+  "mesenchymal development"                         = "Mesenchymal development",
+  "epithelial-mesenchymal transition"               = "Epithelial\u2013mesenchymal transition",
+  "cardiovascular and endocardial development"      = "Cardiovascular and endocardial development",
+  "developmental signalling"                        = "Developmental signaling",
+  "endothelial specification"                       = "Endothelial specification",
+  "VEGF signaling and endothelial response"         = "VEGF signaling and endothelial response",
+  "angiogenesis / vasculogenesis"                   = "Angiogenesis / vasculogenesis",
+  "cell adhesion and cell-matrix interaction"       = "Cell adhesion and cell\u2013matrix interaction",
+  "extracellular matrix organization / remodelling" = "Extracellular matrix organization / remodeling",
+  "mechanotransduction / shear stress"              = "Mechanotransduction / shear stress",
+  "vascular homeostasis / fluid regulation"         = "Vascular homeostasis / fluid regulation",
+  "hemostasis / coagulation"                        = "Hemostasis / coagulation",
+  "immune / inflammatory response"                  = "Immune / inflammatory response"
+)
+
+module_score_plot <- module_score_mat
+raw_names <- trimws(rownames(module_score_plot))
+
+# Check: every module name must have a display name (expect character(0))
+print(setdiff(raw_names, names(module_display_names)))
+
+rownames(module_score_plot) <- module_display_names[raw_names]
+
+# Fixed order (same as the names vector above)
+module_score_plot <- module_score_plot[unname(module_display_names), , drop = FALSE]
+
+# Check: 15 modules, no missing rows (expect 15 and FALSE)
+nrow(module_score_plot)
+any(is.na(rownames(module_score_plot)))
+
+col_group <- factor(
+  c(rep("iPSC", 3), rep("eMPC", 3), rep("EC", 3)),
+  levels = c("iPSC", "eMPC", "EC")
+)
+
+top_ha <- HeatmapAnnotation(
+  Group = anno_block(
+    gp = gpar(fill = "grey95", col = "grey70"),
+    labels = c("iPSC", "eMPC", "EC"),
+    labels_gp = gpar(fontsize = 11, fontface = "bold", col = "black")
+  ),
+  show_annotation_name = FALSE,
+  height = unit(7, "mm")
+)
+
+col_fun_score <- colorRamp2(
+  c(-max(abs(module_score_plot)), 0, max(abs(module_score_plot))),
+  c("#2166AC", "white", "#B2182B")
+)
+
+ht_scores <- Heatmap(
+  module_score_plot,
+  name = "Module\nscore",
+  col = col_fun_score,
+  column_split = col_group,
+  column_title = NULL,
+  top_annotation = top_ha,
+  cluster_columns = FALSE,
+  cluster_rows = FALSE,
+  row_names_side = "left",
+  row_names_gp = gpar(fontsize = 10),
+  row_names_max_width = max_text_width(rownames(module_score_plot),
+                                       gp = gpar(fontsize = 10)),
+  column_gap = unit(1, "mm"),
+  border = TRUE,
+  cell_fun = function(j, i, x, y, width, height, fill) {
+    grid.text(sprintf("%.2f", module_score_plot[i, j]), x, y,
+              gp = gpar(fontsize = 7, col = "black"))
+  }
+)
+
+draw(ht_scores)
+```
+
+```{r export_module_scores}
+write_xlsx(
+  list("module_scores" = as.data.frame(module_score_mat) %>%
+         tibble::rownames_to_column("biological_module")),
+  path = "module_scores_by_sample.xlsx"
+)
+
+cat("Exported module_scores_by_sample.xlsx —", nrow(module_score_mat), "modules\n")
+```
+
+# 11. Core Gene Heatmap (Secondary Figure — Representative Genes per Module)
+
+```{r select_core_genes}
+# Select up to 10 representative "core genes" per module, from the full
+# leading-edge gene set, using:
+#   1. Recurrence — number of distinct yes_apriori pathways within that
+#      module in which the gene appears as a leading-edge member
+#      (module_pathway_counts, built in Section 9). This criterion only
+#      discriminates between genes in modules with more than one pathway.
+#   2. Stage-aligned expression — the gene's mean z-score at the stage
+#      associated with the module. The module stage is the stage with the
+#      highest mean module score (Section 10), so core genes represent the
+#      same stage pattern shown in the module-score heatmap.
+#   Safeguard: the gene must be significant (padj < 0.05) in at least one
+#   of the two contrasts involving the module stage:
+#      eMPC modules: L1 (eMPC vs iPSC) or L2 (EC vs eMPC)
+#      EC modules:   L2 (EC vs eMPC)  or L3 (EC vs iPSC)
+#
+# "pluripotency / stem cell maintenance" is excluded, as in Section 10:
+# its single GO term is significant only in EC vs eMPC.
+
+n_per_module <- 10
+
+# Sample columns per stage
+stage_cols <- list(
+  iPSC = grep("^iPSC", colnames(mat_z), value = TRUE),
+  eMPC = grep("^eMPC", colnames(mat_z), value = TRUE),
+  EC   = grep("^EC",   colnames(mat_z), value = TRUE)
+)
+
+# Stage associated with each module (highest mean module score)
+module_stage <- tibble::tibble(
+  biological_category = trimws(rownames(module_score_mat)),
+  iPSC = rowMeans(module_score_mat[, stage_cols$iPSC, drop = FALSE]),
+  eMPC = rowMeans(module_score_mat[, stage_cols$eMPC, drop = FALSE]),
+  EC   = rowMeans(module_score_mat[, stage_cols$EC,   drop = FALSE])
+) %>%
+  dplyr::mutate(
+    module_stage = c("iPSC", "eMPC", "EC")[max.col(cbind(iPSC, eMPC, EC),
+                                                    ties.method = "first")]
+  ) %>%
+  dplyr::select(biological_category, module_stage)
+
+# Check: module stage assignment (expect 5 eMPC and 10 EC, no iPSC)
+print(module_stage, n = Inf)
+stopifnot(all(module_stage$module_stage %in% c("eMPC", "EC")))
+
+# Mean z-score of each gene at eMPC and at EC
+gene_stage_z <- tibble::tibble(
+  gene   = rownames(mat_z),
+  z_eMPC = rowMeans(mat_z[, stage_cols$eMPC, drop = FALSE]),
+  z_EC   = rowMeans(mat_z[, stage_cols$EC,   drop = FALSE])
+)
+
+gene_module_scored <- module_pathway_counts %>%
+  dplyr::mutate(biological_category = trimws(biological_category)) %>%
+  dplyr::filter(biological_category != "pluripotency / stem cell maintenance") %>%
+  dplyr::left_join(
+    gene_trajectory_annotated %>%
+      dplyr::select(GeneID, L1_logFC, L1_padj, L2_logFC, L2_padj,
+                    L3_logFC, L3_padj, trajectory_sign_class, near_flat_transition),
+    by = c("gene" = "GeneID")
+  ) %>%
+  dplyr::filter(!is.na(L3_logFC)) %>%  # keep only genes present in the trajectory table
+  dplyr::left_join(module_stage, by = "biological_category") %>%
+  dplyr::left_join(gene_stage_z, by = "gene") %>%
+  dplyr::mutate(
+    stage_z = ifelse(module_stage == "eMPC", z_eMPC, z_EC),
+    sig_stage_contrast = ifelse(
+      module_stage == "eMPC",
+      L1_padj < 0.05 | L2_padj < 0.05,
+      L2_padj < 0.05 | L3_padj < 0.05
+    )
+  )
+
+# Check: every module matched a stage (expect 0)
+sum(is.na(gene_module_scored$module_stage))
+
+# Previous selection (L3-based tiebreak), kept only for comparison
+core_genes_old <- gene_module_scored %>%
+  dplyr::group_by(biological_category) %>%
+  dplyr::arrange(dplyr::desc(n_pathways_in_module), L3_padj,
+                 dplyr::desc(abs(L3_logFC)), .by_group = TRUE) %>%
+  dplyr::slice_head(n = n_per_module) %>%
+  dplyr::ungroup()
+
+# New selection
+core_genes <- gene_module_scored %>%
+  dplyr::filter(sig_stage_contrast) %>%
+  dplyr::group_by(biological_category) %>%
+  dplyr::arrange(dplyr::desc(n_pathways_in_module), dplyr::desc(stage_z),
+                 .by_group = TRUE) %>%
+  dplyr::slice_head(n = n_per_module) %>%
+  dplyr::ungroup()
+
+cat("Core genes selected:", nrow(core_genes), "across",
+    dplyr::n_distinct(core_genes$biological_category), "modules\n")
+cat("Unique genes (some may repeat across modules):", dplyr::n_distinct(core_genes$gene), "\n")
+
+# Check: genes per module (expect 10 each; fewer means not enough significant genes)
+print(dplyr::count(core_genes, biological_category), n = Inf)
+
+# Check: trajectory classes of core genes per module
+print(table(core_genes$biological_category, core_genes$trajectory_sign_class))
+
+# Comparison with the previous selection: genes kept, removed and added per module
+selection_changes <- dplyr::full_join(
+  core_genes_old %>% dplyr::distinct(biological_category, gene) %>% dplyr::mutate(old = TRUE),
+  core_genes     %>% dplyr::distinct(biological_category, gene) %>% dplyr::mutate(new = TRUE),
+  by = c("biological_category", "gene")
+) %>%
+  dplyr::mutate(
+    status = dplyr::case_when(
+      old & new ~ "kept",
+      old       ~ "removed",
+      TRUE      ~ "added"
+    )
+  )
+
+print(table(selection_changes$biological_category, selection_changes$status))
+```
+
+```{r build_core_gene_matrix}
+# Build the expression matrix for the core gene set. If a gene was
+# selected under more than one module, it appears once per module here
+# (deliberately — the point of this figure is "which genes represent
+# module X", so the same gene can illustrate more than one module).
+# Module labels use the display names of the module-score heatmap
+# (module_display_names, Section 10): American spelling, sentence case.
+# Modules are ordered alphabetically (case-insensitive).
+# n_show controls how many core genes per module are displayed in the
+# figure (the selection itself and the exported table keep all 10).
+
+n_show <- 10  # set to 5 for the main-text version of the figure
+
+# Wrap long module names for the row titles
+module_labels_wrapped <- vapply(module_display_names, function(x)
+  paste(strwrap(x, width = 28), collapse = "\n"), character(1))
+
+core_gene_order <- core_genes %>%
+  dplyr::group_by(biological_category) %>%
+  dplyr::arrange(dplyr::desc(n_pathways_in_module), dplyr::desc(stage_z),
+                 .by_group = TRUE) %>%
+  dplyr::slice_head(n = n_show) %>%
+  dplyr::ungroup() %>%
+  dplyr::arrange(tolower(biological_category), dplyr::desc(n_pathways_in_module),
+                 dplyr::desc(stage_z)) %>%
+  dplyr::mutate(module_label = unname(module_labels_wrapped[biological_category]))
+
+# Check: every module has a display name (expect 0)
+sum(is.na(core_gene_order$module_label))
+
+mat_core <- mat_z[core_gene_order$gene, , drop = FALSE]
+rownames(mat_core) <- core_gene_order$gene
+
+row_split_core <- factor(core_gene_order$module_label,
+                         levels = unique(core_gene_order$module_label))
+
+cat("Core gene matrix:", nrow(mat_core), "rows x", ncol(mat_core), "columns\n")
+```
+
+```{r draw_core_gene_heatmap, fig.width=7, fig.height=2 + nrow(mat_core) * 0.13}
+# Figure height scales with the number of displayed genes
+# (about 21 in for 150 rows, about 12 in for 75 rows).
+# Column width is fixed (8 mm per sample) and thin white lines separate cells.
+
+col_group <- factor(
+  c(rep("iPSC", 3), rep("eMPC", 3), rep("EC", 3)),
+  levels = c("iPSC", "eMPC", "EC")
+)
+
+top_ha <- HeatmapAnnotation(
+  Group = anno_block(
+    gp = gpar(fill = "grey95", col = "grey70"),
+    labels = c("iPSC", "eMPC", "EC"),
+    labels_gp = gpar(fontsize = 11, fontface = "bold", col = "black")
+  ),
+  show_annotation_name = FALSE,
+  height = unit(7, "mm")
+)
+
+col_fun <- colorRamp2(c(-2, 0, 2), c("#2166AC", "white", "#B2182B"))
+
+ht_core <- Heatmap(
+  mat_core,
+  name = "z-score",
+  col = col_fun,
+  width = unit(8 * ncol(mat_core), "mm"),
+  rect_gp = gpar(col = "white", lwd = 0.4),
+  column_split = col_group,
+  column_title = NULL,
+  top_annotation = top_ha,
+  row_split = row_split_core,
+  cluster_columns = FALSE,
+  cluster_row_slices = FALSE,
+  cluster_rows = FALSE,
+  show_row_names = TRUE,
+  row_names_gp = gpar(fontsize = 7),
+  row_title_rot = 0,
+  row_title_gp = gpar(fontsize = 8, fontface = "bold"),
+  row_gap = unit(1, "mm"),
+  column_gap = unit(1, "mm"),
+  border = TRUE
+)
+
+# Left padding so that long module names are not cut
+# (order: bottom, left, top, right)
+draw(ht_core, padding = unit(c(2, 12, 2, 2), "mm"))
+```
+
+```{r export_core_genes}
+# Export the core gene table, including the module stage and the
+# stage-aligned z-score used for selection, plus the display module name.
+
+core_genes_export <- core_genes %>%
+  dplyr::mutate(module = unname(module_display_names[biological_category])) %>%
+  dplyr::select(module, biological_category, gene, n_pathways_in_module,
+                module_stage, stage_z, L1_logFC, L1_padj, L2_logFC, L2_padj,
+                L3_logFC, L3_padj, trajectory_sign_class, near_flat_transition)
+
+write_xlsx(
+  list("core_genes" = core_genes_export,
+       "selection_changes" = selection_changes),
+  path = "core_genes_by_module.xlsx"
+)
+
+cat("Exported core_genes_by_module.xlsx —", nrow(core_genes_export), "rows\n")
+```
+
+# 12. Illustrative Expression Trajectory Plots — one representative gene per trajectory_sign_class
+
+```{r select_representative_genes}
+# Pick the strongest, cleanest representative per trajectory_sign_class:
+# excludes near_flat_transition genes, then ranks by combined significance
+# (lowest max of L1_padj, L2_padj) as a simple robustness criterion.
+
+representative_genes <- gene_trajectory_annotated %>%
+  dplyr::filter(!near_flat_transition) %>%
+  dplyr::mutate(worst_padj = pmax(L1_padj, L2_padj)) %>%
+  dplyr::group_by(trajectory_sign_class) %>%
+  dplyr::slice_min(worst_padj, n = 1, with_ties = FALSE) %>%
+  dplyr::ungroup()
+
+print(representative_genes[, c("GeneID","trajectory_sign_class","L1_logFC","L2_logFC")])
+```
+
+```{r trajectory_line_plots, fig.width=10, fig.height=6}
+y <- readRDS("y_voom_backbone.rds")
+
+genes_to_plot <- representative_genes$GeneID
+expr_long <- as.data.frame(y$E[genes_to_plot, , drop = FALSE]) %>%
+  tibble::rownames_to_column("Gene") %>%
+  tidyr::pivot_longer(-Gene, names_to = "Sample", values_to = "Expression") %>%
+  dplyr::mutate(Stage = dplyr::case_when(
+    grepl("iPSC", Sample) ~ "iPSC",
+    grepl("eMPC", Sample) ~ "eMPC",
+    grepl("EC", Sample)   ~ "EC"
+  )) %>%
+  dplyr::mutate(Stage = factor(Stage, levels = c("iPSC","eMPC","EC")))
+
+ggplot(expr_long, aes(x = Stage, y = Expression, group = Sample)) +
+  geom_point(size = 2, alpha = 0.7) +
+  stat_summary(aes(group = Gene), fun = mean, geom = "line", linewidth = 1, color = "#B2182B") +
+  facet_wrap(~ Gene, scales = "free_y") +
+  labs(title = "Representative genes per trajectory class",
+       y = "log2-CPM (voom normalized)", x = NULL) +
+  theme_bw() +
+  theme(strip.text = element_text(face = "bold"))
+```

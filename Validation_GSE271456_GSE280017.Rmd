@@ -1,0 +1,416 @@
+---
+title: "Validation_GSE271456_GSE280017"
+output:
+  pdf_document:
+        latex_engine: xelatex
+  html_document: default
+header-includes:
+  - \usepackage{fvextra}
+  - \DefineVerbatimEnvironment{Highlighting}{Verbatim}{breaklines,commandchars=\\\{\}}  
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, message=FALSE}
+# Library Import
+library(dplyr)
+library(biomaRt)
+library(ggplot2)
+library(ggfortify)
+library(ComplexHeatmap)
+library(circlize)
+library(grid)
+
+setwd("~/Desktop/Tese/R/Transcriptomic analysis")
+```
+
+
+# 1. Data Import
+
+```{r import, message=FALSE}
+
+# Check files found
+ipsc_files <- list.files("GSE280017_RAW",
+                          pattern = "\\.isoforms\\.results\\.gz$",
+                          full.names = TRUE)
+
+ec_files <- list.files("GSE271456_RAW",
+                        pattern = "\\.isoforms\\.results\\.gz$",
+                        full.names = TRUE)
+
+cat("iPSC files found:", length(ipsc_files), "\n")
+cat("EC files found:",   length(ec_files),   "\n")
+
+# Define sample names
+all_files <- c(ipsc_files, ec_files)
+all_names <- c(paste0("iPSC_", 1:10), paste0("EC_", 1:10))
+
+# Load each file, aggregate TPM to gene level
+sample_list <- list()
+
+for (i in seq_along(all_files)) {
+  cat("Loading:", all_names[i], "\n")
+  
+  df <- read.table(all_files[i], header = TRUE, sep = "\t")
+  
+  df_agg <- df %>%
+    dplyr::select(gene_id, TPM) %>%
+    group_by(gene_id) %>%
+    summarise(TPM = sum(TPM), .groups = "drop")
+  
+  colnames(df_agg)[2] <- all_names[i]
+  
+  sample_list[[i]] <- df_agg
+}
+
+# Join all samples on gene_id
+tpm_joined <- sample_list[[1]]
+
+for (i in 2:length(sample_list)) {
+  tpm_joined <- full_join(tpm_joined, sample_list[[i]], by = "gene_id")
+}
+
+# Convert to matrix - correctly preserving rownames
+tpm_matrix <- as.matrix(tpm_joined[, -1])
+rownames(tpm_matrix) <- tpm_joined$gene_id
+tpm_matrix[is.na(tpm_matrix)] <- 0
+
+# Confirm
+head(rownames(tpm_matrix))
+dim(tpm_matrix)
+```
+
+# 2. Ensembl ID to HGNC Symbol Conversion
+
+```{r biomart, message=FALSE}
+
+# Clean Ensembl IDs - remove version suffix (e.g. ENSG00000000003.14_2 -> ENSG00000000003)
+ensembl_ids_raw <- rownames(tpm_matrix)
+ensembl_ids_clean <- sub("\\..*", "", ensembl_ids_raw)
+
+# Retrieve HGNC symbols for all Ensembl IDs
+# The mapping is saved to a file the first time, so later knits do not depend on Ensembl
+map_file <- "~/Desktop/Tese/R/Transcriptomic analysis/ensembl_map_gse271456_gse280017.rds"
+
+if (file.exists(map_file)) {
+  gene_map <- readRDS(map_file)
+} else {
+  # Same BioMart query as getBM (ensembl_gene_id + hgnc_symbol, unique rows),
+  # sent as GET because POST requests from biomaRt returned HTTP 405
+  query_xml <- paste0(
+    '<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE Query>',
+    '<Query virtualSchemaName="default" formatter="TSV" header="1" uniqueRows="1">',
+    '<Dataset name="hsapiens_gene_ensembl" interface="default">',
+    '<Attribute name="ensembl_gene_id"/><Attribute name="hgnc_symbol"/>',
+    '</Dataset></Query>'
+  )
+  url <- paste0("https://www.ensembl.org/biomart/martservice?query=",
+                utils::URLencode(query_xml, reserved = TRUE))
+  res <- curl::curl_fetch_memory(url)
+  full_map <- read.delim(text = rawToChar(res$content), stringsAsFactors = FALSE)
+  colnames(full_map) <- c("ensembl_gene_id", "hgnc_symbol")
+  full_map$hgnc_symbol[is.na(full_map$hgnc_symbol)] <- ""
+
+  # Keep only the IDs present in this dataset (as getBM with a filter would return)
+  gene_map <- full_map[full_map$ensembl_gene_id %in% ensembl_ids_clean, ]
+  saveRDS(gene_map, map_file)
+}
+
+# Remove entries with empty HGNC symbol
+gene_map <- gene_map[gene_map$hgnc_symbol != "", ]
+
+# Match clean IDs back to original rownames
+id_df <- data.frame(
+  ensembl_clean = ensembl_ids_clean,
+  original = ensembl_ids_raw,
+  stringsAsFactors = FALSE
+)
+id_df <- left_join(id_df, gene_map, by = c("ensembl_clean" = "ensembl_gene_id"))
+
+# Keep only rows with valid HGNC symbol
+id_df <- id_df[!is.na(id_df$hgnc_symbol) & id_df$hgnc_symbol != "", ]
+
+# Subset matrix and rename rows
+tpm_hgnc <- tpm_matrix[id_df$original, ]
+rownames(tpm_hgnc) <- id_df$hgnc_symbol
+
+# Remove duplicate gene symbols - keep highest mean expression
+tpm_hgnc <- tpm_hgnc[order(rowMeans(tpm_hgnc), decreasing = TRUE), ]
+tpm_hgnc <- tpm_hgnc[!duplicated(rownames(tpm_hgnc)), ]
+
+# Confirm
+dim(tpm_hgnc)
+head(rownames(tpm_hgnc))
+```
+
+# 3. Filtration
+
+```{r filtration}
+
+# Define group labels
+group_labels_gse <- c(rep("iPSC", 10), rep("EC", 10))
+
+# Define metadata
+metadata_gse <- data.frame(
+  sample = colnames(tpm_hgnc),
+  group  = group_labels_gse
+)
+
+# Require TPM > 1 in at least 50% of samples within at least one group
+min_present <- function(n) ceiling(n * 0.5)
+
+groups <- unique(metadata_gse$group)
+
+keep_by_group <- lapply(groups, function(g) {
+  cols_g <- metadata_gse$sample[metadata_gse$group == g]
+  n_g    <- length(cols_g)
+  rowSums(tpm_hgnc[, cols_g, drop = FALSE] > 1) >= min_present(n_g)
+})
+
+keep         <- Reduce(`|`, keep_by_group)
+tpm_filtered <- tpm_hgnc[keep, ]
+
+# Confirm
+dim(tpm_filtered)
+```
+
+# 4. Transformation
+
+```{r Transformation}
+
+# LOG2 TRANSFORMATION 
+expr_log_gse271456 <- log2(tpm_filtered + 1)
+
+# CANONICAL MARKER CHECK - Full canonical panel
+pluripotency         <- c("POU5F1", "SOX2", "KLF4", "MYC")
+mesoderm_induction   <- c("TBXT", "MIXL1", "EOMES", "ETV2", "KDR", "CD34")
+endothelial_identity <- c("PECAM1", "CDH5", "VWF", "NOS3", "SOX17", "ERG")
+
+canonical_genes <- c(pluripotency, mesoderm_induction, endothelial_identity)
+
+# Genes absent from dataset entirely
+genes_not_in_data <- canonical_genes[!canonical_genes %in% rownames(tpm_hgnc)]
+
+# Genes removed by filtration
+genes_filtered_out <- canonical_genes[canonical_genes %in% rownames(tpm_hgnc) &
+                                      !canonical_genes %in% rownames(expr_log_gse271456)]
+
+# Genes available for analysis
+genes_use_gse271456 <- canonical_genes[canonical_genes %in% rownames(expr_log_gse271456)]
+
+cat("=== CANONICAL MARKER CHECK ===\n")
+cat("Used in analysis:      ", paste(genes_use_gse271456,          collapse = ", "), "\n")
+cat("Absent from dataset:   ", paste(genes_not_in_data,  collapse = ", "), "\n")
+cat("Removed by filtration: ", paste(genes_filtered_out, collapse = ", "), "\n")
+
+```
+# 5. PCA 
+```{r PCA}
+
+# Prepare data matrix for PCA
+dfforpca_gse <- t(expr_log_gse271456)
+dfforpca_gse <- as.data.frame(dfforpca_gse)
+dfforpca_gse$group_labels <- group_labels_gse
+
+# Specify factor levels in trajectory order
+dfforpca_gse$group_labels <- factor(dfforpca_gse$group_labels,
+                                     levels = c("iPSC", "EC"))
+
+# Run PCA
+numcol_gse  <- 1:(ncol(dfforpca_gse) - 1)
+pca_res_gse <- prcomp(dfforpca_gse[, numcol_gse], scale = FALSE)
+
+# PCA plot
+p_gse <- autoplot(
+  pca_res_gse,
+  data   = dfforpca_gse,
+  x      = 1,
+  y      = 2,
+  colour = "group_labels",
+  size   = 8,
+  alpha  = 0.7
+) +
+  theme_bw() +
+  scale_colour_manual(
+    name   = "Cell Type",
+    values = c("iPSC" = "lightblue",
+               "EC"   = "lightgreen")
+  ) +
+  ggtitle("PCA Plot - GSE271456/GSE280017") +
+  theme(
+    plot.title       = element_text(hjust = 0.5),
+    axis.line        = element_line(colour = "black"),
+    panel.grid.minor = element_blank(),
+    panel.border     = element_blank(),
+    panel.background = element_blank()
+  )
+
+p_gse
+
+# Top contributing genes per PC
+contribs1_gse <- pca_res_gse$rotation[, 1]
+contribs2_gse <- pca_res_gse$rotation[, 2]
+
+(pos1genes_gse <- sort(contribs1_gse, decreasing = TRUE)[1:10])
+(neg1genes_gse <- sort(contribs1_gse, decreasing = FALSE)[1:10])
+(pos2genes_gse <- sort(contribs2_gse, decreasing = TRUE)[1:10])
+(neg2genes_gse <- sort(contribs2_gse, decreasing = FALSE)[1:10])
+```
+
+# 6. Heatmap
+
+```{r heatmap, fig.width=12, fig.height=6.5}
+
+# Create stage mapping
+stage_map_gse271456 <- c(
+  setNames(rep("Pluripotency",         length(pluripotency)),         pluripotency),
+  setNames(rep("Mesoderm induction",   length(mesoderm_induction)),   mesoderm_induction),
+  setNames(rep("Endothelial identity", length(endothelial_identity)), endothelial_identity)
+)
+
+row_stage_gse271456 <- factor(
+  stage_map_gse271456[genes_use_gse271456],
+  levels = c("Pluripotency", "Mesoderm induction", "Endothelial identity")
+)
+
+# Subset and row-scale expression matrix
+mat <- as.matrix(expr_log_gse271456[genes_use_gse271456, , drop = FALSE])
+mat_z_gse271456 <- t(scale(t(mat)))
+mat_z_gse271456[is.na(mat_z_gse271456)] <- 0
+
+# Column groups
+col_group_gse271456 <- factor(
+  c(rep("iPSC", 10), rep("EC", 10)),
+  levels = c("iPSC", "EC")
+)
+
+# Heatmap colour scale
+col_fun <- colorRamp2(
+  c(-2, 0, 2),
+  c("#2166AC", "white", "#B2182B")
+)
+
+# Top annotation
+top_ha <- HeatmapAnnotation(
+  Group = anno_block(
+    gp        = gpar(fill = "grey95", col = "grey70"),
+    labels    = c("iPSC", "EC"),
+    labels_gp = gpar(fontsize = 11, fontface = "bold", col = "black")
+  ),
+  show_annotation_name = FALSE,
+  height = unit(7, "mm")
+)
+
+# Left annotation
+left_ha <- rowAnnotation(
+  Stage = anno_block(
+    gp         = gpar(fill = "grey95", col = "grey70"),
+    labels     = c("Pluripotency", "Mesoderm induction", "Endothelial identity"),
+    labels_gp  = gpar(fontsize = 10, fontface = "bold", col = "black"),
+    labels_rot = 0
+  ),
+  show_annotation_name = FALSE,
+  width = unit(37, "mm")
+)
+
+# Draw heatmap
+ht <- Heatmap(
+  mat_z_gse271456,
+  name = "Z-score\nexpression",
+  col  = col_fun,
+
+  cluster_rows    = FALSE,
+  cluster_columns = FALSE,
+
+  row_split    = row_stage_gse271456,
+  column_split = col_group_gse271456,
+
+  top_annotation  = top_ha,
+  left_annotation = left_ha,
+
+  column_title = NULL,
+  row_title    = NULL,
+
+  show_row_names    = TRUE,
+  row_names_side    = "right",
+  row_names_gp      = gpar(fontsize = 10),
+
+  show_column_names = TRUE,
+  column_names_rot  = 90,
+  column_names_gp   = gpar(fontsize = 10),
+
+  show_row_dend    = FALSE,
+  show_column_dend = FALSE,
+
+  row_gap    = unit(3, "mm"),
+  column_gap = unit(3, "mm"),
+
+  rect_gp = gpar(col = "grey70", lwd = 0.6),
+  border  = TRUE,
+
+  heatmap_legend_param = list(
+    title  = "Z-score\nexpression",
+    at     = c(-2, -1, 0, 1, 2),
+    labels = c("-2", "-1", "0", "1", "2")
+  )
+)
+
+draw(
+  ht,
+  heatmap_legend_side = "right",
+  column_title        = "Canonical marker expression across iPSC and EC stages - GSE271456/GSE280017",
+  column_title_side   = "top",
+  column_title_gp     = gpar(fontsize = 14, fontface = "bold"),
+  padding             = unit(c(4, 2, 2, 20), "mm")
+)
+```
+# 7. Export
+```{r export}
+library(writexl)
+
+# Define full canonical panel for export
+canonical_genes <- c("POU5F1", "SOX2", "KLF4", "MYC",
+                     "TBXT", "MIXL1", "EOMES", "ETV2", "KDR", "CD34",
+                     "PECAM1", "CDH5", "VWF", "NOS3", "SOX17", "ERG")
+
+# Create output directory
+dir.create("results/GSE271456_GSE280017", recursive = TRUE, showWarnings = FALSE)
+
+# 1. Gene availability table
+gene_availability <- data.frame(
+  gene          = canonical_genes,
+  in_dataset    = canonical_genes %in% rownames(tpm_hgnc),
+  after_filter  = canonical_genes %in% rownames(expr_log_gse271456),
+  status        = ifelse(
+    !canonical_genes %in% rownames(tpm_hgnc), "Absent from dataset",
+    ifelse(!canonical_genes %in% rownames(expr_log_gse271456), "Removed by filtration", "Used")
+  )
+)
+
+write.csv(gene_availability,
+          "results/GSE271456_GSE280017/gene_availability.csv",
+          row.names = FALSE)
+
+# 2. PCA plot
+pdf("results/GSE271456_GSE280017/pca_plot.pdf", width = 7, height = 6)
+print(p_gse)
+dev.off()
+
+# 3. Heatmap
+pdf("results/GSE271456_GSE280017/heatmap.pdf", width = 12, height = 6.5)
+draw(
+  ht,
+  heatmap_legend_side = "right",
+  column_title        = "Canonical marker expression across iPSC and EC stages - GSE271456/GSE280017",
+  column_title_side   = "top",
+  column_title_gp     = gpar(fontsize = 14, fontface = "bold"),
+  padding             = unit(c(4, 2, 2, 20), "mm")
+)
+dev.off()
+
+write.csv(mat_z_gse271456, "results/GSE271456_GSE280017/mat_z.csv")
+```
+

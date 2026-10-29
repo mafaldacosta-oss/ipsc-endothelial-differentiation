@@ -1,0 +1,1067 @@
+---
+title: "Transcription Factor Track — Differentiation Timeline"
+output:
+  pdf_document:
+        latex_engine: xelatex
+  html_document: default
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(fig.path = "figures/", dev = c("png", "pdf"), dpi = 300)
+```
+
+```{r libraries, message=FALSE}
+# Load required libraries
+library(readxl)    
+library(dplyr)        
+library(tidyr)        
+library(writexl)      
+library(decoupleR)    # TF regulon activity inference
+library(OmnipathR)    # underlying source for CollecTRI regulons
+```
+
+```{r setup_dir}
+
+setwd("~/Desktop/Tese/R/Transcriptomic analysis")
+```
+
+# 1. Build the DEG Pool (Backbone, restricted to the common universe)
+
+```{r build-deg-pool}
+d1 <- read_excel("DEGs_full_toptable_three_contrasts.xlsx", sheet = "eMPC_vs_iPSC") %>%
+  dplyr::rename(L1_logFC = logFC, L1_t = t, L1_pval = P.Value, L1_padj_full_backbone = adj.P.Val)
+d2 <- read_excel("DEGs_full_toptable_three_contrasts.xlsx", sheet = "EC_vs_eMPC") %>%
+  dplyr::rename(L2_logFC = logFC, L2_t = t, L2_pval = P.Value, L2_padj_full_backbone = adj.P.Val)
+d3 <- read_excel("DEGs_full_toptable_three_contrasts.xlsx", sheet = "EC_vs_iPSC") %>%
+  dplyr::rename(L3_logFC = logFC, L3_t = t, L3_pval = P.Value, L3_padj_full_backbone = adj.P.Val)
+
+wide_full <- d1 %>%
+  dplyr::inner_join(d2, by = "GeneID") %>%
+  dplyr::inner_join(d3, by = "GeneID")
+cat("Genes in wide table (full backbone):", nrow(wide_full), "\n")
+```
+
+```{r restrict-common-universe}
+# Restrict to the 11,113-gene common universe (backbone ∩ GSE271101,
+# Section 3.2.8) — "backbone validated" = common universe.
+
+common_universe_genes <- readRDS("common_universe_genes.rds") 
+cat("Common universe genes:", length(common_universe_genes), "\n")
+
+wide <- wide_full %>% dplyr::filter(GeneID %in% common_universe_genes)
+cat("Genes in wide table (restricted to common universe):", nrow(wide), "\n")
+
+# Recompute BH adjustment within the common-universe testing set — the
+# original adj.P.Val columns were corrected against the full backbone
+# gene set (13,611 genes here), not this restricted set.
+wide <- wide %>%
+  dplyr::mutate(
+    L1_padj = p.adjust(L1_pval, method = "BH"),
+    L2_padj = p.adjust(L2_pval, method = "BH"),
+    L3_padj = p.adjust(L3_pval, method = "BH")
+  )
+```
+
+```{r deg-pool-strict}
+# Primary DEG pool: padj < 0.05 & |log2FC| >= 1, now computed within
+# the common-universe testing set.
+is_deg_L1 <- wide$L1_padj < 0.05 & abs(wide$L1_logFC) >= 1
+is_deg_L2 <- wide$L2_padj < 0.05 & abs(wide$L2_logFC) >= 1
+is_deg_L3 <- wide$L3_padj < 0.05 & abs(wide$L3_logFC) >= 1
+deg_pool <- wide$GeneID[is_deg_L1 | is_deg_L2 | is_deg_L3]
+cat("DEGs (backbone within common universe, any contrast, padj<0.05 & |log2FC|>=1):",
+    length(deg_pool), "\n")
+```
+
+```{r deg-pool-broad}
+# Sensitivity analysis only — NOT used in the main pool. Drops the
+# |log2FC| >= 1 threshold, same rationale as before, now within the
+# common-universe testing set.
+is_deg_L1_broad <- wide$L1_padj < 0.05
+is_deg_L2_broad <- wide$L2_padj < 0.05
+is_deg_L3_broad <- wide$L3_padj < 0.05
+deg_pool_broad <- wide$GeneID[is_deg_L1_broad | is_deg_L2_broad | is_deg_L3_broad]
+cat("DEGs (backbone within common universe, any contrast, padj<0.05 only):",
+    length(deg_pool_broad), "\n")
+cat("Difference (broad - strict):", length(deg_pool_broad) - length(deg_pool), "\n")
+```
+
+# 2. Build the Leading-Edge Gene Pool (yes_apriori Pathways)
+
+```{r load_curation_and_leading_edge}
+# Load the a priori curated GO term file and extract leading edge genes
+# from yes_apriori pathways, following the same self-sufficient logic
+# already used in Molecular_Signatures.Rmd and
+# STRING_Network.Rmd.
+
+curation_eMPC_vs_iPSC <- read_excel(
+  "~/Desktop/Tese/R/GSEA_GO_BP_curated_apriori.xlsx", sheet = "eMPC_vs_iPSC", skip = 2)
+curation_EC_vs_eMPC   <- read_excel(
+  "~/Desktop/Tese/R/GSEA_GO_BP_curated_apriori.xlsx", sheet = "EC_vs_eMPC", skip = 0)
+curation_EC_vs_iPSC   <- read_excel(
+  "~/Desktop/Tese/R/GSEA_GO_BP_curated_apriori.xlsx", sheet = "EC_vs_iPSC", skip = 0)
+
+extract_leadinggene <- function(curation_df, contrast_name) {
+
+  n <- ncol(curation_df)
+  colnames(curation_df)[2] <- "include_apriori_std"
+  colnames(curation_df)[3] <- "contrast_side_std"
+  colnames(curation_df)[4] <- "biological_category_std"
+  colnames(curation_df)[n] <- "leadingEdge_std"
+
+  stopifnot(colnames(curation_df)[2] == "include_apriori_std")
+
+  selected <- curation_df[
+    !is.na(curation_df$include_apriori_std) &
+    curation_df$include_apriori_std == "yes_apriori", ]
+
+  cat(contrast_name, "— yes_apriori pathways:", nrow(selected), "\n")
+
+  result <- selected %>%
+    dplyr::select(
+      pathway              = pathway,
+      pathway_clean         = pathway_clean,
+      contrast_side         = contrast_side_std,
+      biological_category   = biological_category_std,
+      NES,
+      leadingEdge           = leadingEdge_std
+    ) %>%
+    dplyr::mutate(
+      contrast = contrast_name,
+      leadingEdge = as.character(leadingEdge)
+    ) %>%
+    tidyr::separate_rows(leadingEdge, sep = ",\\s*") %>%
+    dplyr::rename(gene = leadingEdge) %>%
+    dplyr::filter(!is.na(gene), gene != "")
+
+  return(result)
+}
+
+le_eMPC_vs_iPSC <- extract_leadinggene(curation_eMPC_vs_iPSC, "eMPC_vs_iPSC")
+le_EC_vs_eMPC   <- extract_leadinggene(curation_EC_vs_eMPC,   "EC_vs_eMPC")
+le_EC_vs_iPSC   <- extract_leadinggene(curation_EC_vs_iPSC,   "EC_vs_iPSC")
+
+le_all <- dplyr::bind_rows(le_eMPC_vs_iPSC, le_EC_vs_eMPC, le_EC_vs_iPSC)
+leading_edge_pool <- unique(le_all$gene)
+
+cat("\nLeading edge genes (yes_apriori, union across contrasts):", length(leading_edge_pool), "\n")
+```
+
+```{r combine_pools}
+# Combine the two pools: DEGs (backbone, any contrast) union leading
+# edge genes (yes_apriori). This broad pool is intersected with the TF
+# catalogue in Section 3 — restricting to yes_apriori genes alone would
+# risk missing TFs that drive the trajectory without themselves being a
+# leading-edge member of a curated pathway.
+
+combined_pool <- union(deg_pool, leading_edge_pool)
+
+cat("DEG pool:", length(deg_pool), "\n")
+cat("Leading edge pool:", length(leading_edge_pool), "\n")
+cat("Combined pool (union):", length(combined_pool), "\n")
+```
+
+# 3. Filter to Known Transcription Factors (CollecTRI)
+
+```{r load_collectri}
+# Retrieve the CollecTRI regulon network directly via the OmniPath REST
+# API. The decoupleR::get_collectri() wrapper and the OmnipathR
+# transcriptional()/import_transcriptional_interactions() functions were
+# tried first but failed consistently due to OmniPath server-side
+# instability (confirmed via repeated attempts and a "static table
+# backup" warning) — this direct API call bypasses the failing wrapper
+# layer. 
+
+# CollecTRI is used here as the primary regulon resource for the initial
+# TF activity analysis; its results are subsequently cross-checked
+# against DoRothEA and AnimalTFDB4 in the sections below.
+
+# Columns of interest: source_genesymbol/target_genesymbol (TF/target
+# gene symbols), consensus_stimulation/consensus_inhibition (character
+# "True"/"False", NOT numeric/logical — confirmed via str()). Mode of
+# regulation (mor) is derived as +1/-1 from these two columns;
+# interactions with ambiguous or contradictory consensus direction
+# (both True, or both False) are excluded.
+
+collectri_raw <- read.csv(
+  "https://omnipathdb.org/interactions?resources=CollecTRI&types=transcriptional&genesymbols=1",
+  sep = "\t"
+)
+
+collectri_net <- collectri_raw %>%
+  dplyr::filter(consensus_stimulation == "True" | consensus_inhibition == "True") %>%
+  dplyr::mutate(
+    mor = dplyr::case_when(
+      consensus_stimulation == "True" & consensus_inhibition == "False" ~ 1,
+      consensus_inhibition == "True" & consensus_stimulation == "False" ~ -1,
+      TRUE ~ NA_real_
+    )
+  ) %>%
+  dplyr::filter(!is.na(mor)) %>%
+  dplyr::select(source = source_genesymbol, target = target_genesymbol, mor) %>%
+  dplyr::distinct(source, target, .keep_all = TRUE)
+
+cat("CollecTRI regulon — TFs:", dplyr::n_distinct(collectri_net$source), "\n")
+cat("CollecTRI regulon — TF-target edges:", nrow(collectri_net), "\n")
+```
+
+```{r filter_pool_to_tfs}
+# Restrict the combined pool to genes that are themselves TFs in the
+# CollecTRI catalogue (i.e. appear as a "source" in the regulon).
+
+tf_catalogue <- unique(collectri_net$source)
+candidate_tfs <- intersect(combined_pool, tf_catalogue)
+
+cat("Combined pool genes that are known TFs (CollecTRI):", length(candidate_tfs), "\n")
+```
+
+# 4. TF Activity Scoring per Contrast (decoupleR)
+
+```{r build_t_matrix}
+# Build a genes x contrasts matrix of t-statistics (moderated t from
+# the backbone eBayes fit), used as input for regulon activity scoring.
+# t-statistics are used rather than logFC, consistent with the ranking
+# metric already used for GSEA (Section 3.2.9) — it incorporates both
+# effect size and variance.
+
+mat_t <- wide %>%
+  dplyr::select(GeneID, L1_t, L2_t, L3_t) %>%
+  tibble::column_to_rownames("GeneID") %>%
+  as.matrix()
+
+colnames(mat_t) <- c("eMPC_vs_iPSC", "EC_vs_eMPC", "EC_vs_iPSC")
+
+cat("t-statistic matrix:", nrow(mat_t), "genes x", ncol(mat_t), "contrasts\n")
+```
+
+```{r run_decoupler}
+# Run univariate linear model (ulm) TF activity inference per contrast,
+# against the full CollecTRI network (not restricted to candidate_tfs
+# here — decoupleR requires the full regulon to compute activity scores
+# correctly; filtering to candidate_tfs happens afterwards, in Section 5).
+# minsize = 5: TFs with fewer than 5 target genes present in mat_t are
+# excluded, as per decoupleR's standard recommendation.
+
+tf_activity <- decoupleR::run_ulm(
+  mat     = mat_t,
+  network = collectri_net,
+  .source = "source",
+  .target = "target",
+  .mor    = "mor",
+  minsize = 5
+)
+
+cat("TF activity estimates:", nrow(tf_activity), "\n")
+head(tf_activity)
+```
+
+# 5. Combine Evidence and Score TFs
+
+```{r evidence_scoring}
+# For each candidate TF, count the number of complementary evidence types:
+#   1 point  — is a DEG in the backbone (any contrast)
+#   1 point  — is a leading-edge gene of a yes_apriori pathway
+#   1 point  — has regulon activity with nominal p_value < 0.05 in at least one 
+# contrast, per decoupleR
+# TFs with more evidence types are prioritised for the main timeline figure.
+
+tf_activity_sig <- tf_activity %>%
+  dplyr::filter(statistic == "ulm", p_value < 0.05) %>%
+  dplyr::group_by(source) %>%
+  dplyr::summarise(
+    n_significant_contrasts = dplyr::n_distinct(condition),
+    contrasts_significant    = paste(unique(condition), collapse = "; "),
+    .groups = "drop"
+  )
+
+evidence_table <- data.frame(TF = candidate_tfs) %>%
+  dplyr::mutate(
+    is_deg = TF %in% deg_pool,
+    is_leading_edge = TF %in% leading_edge_pool,
+    has_regulon_activity = TF %in% tf_activity_sig$source,
+    n_evidence_types = is_deg + is_leading_edge + has_regulon_activity
+  ) %>%
+  dplyr::left_join(tf_activity_sig, by = c("TF" = "source")) %>%
+  dplyr::arrange(dplyr::desc(n_evidence_types))
+
+cat("=== Evidence score distribution ===\n")
+print(table(evidence_table$n_evidence_types))
+```
+## 5B. Sensitivity Analysis: BH Correction of TF Activity
+
+```{r tf_activity_bh_sensitivity}
+# Sensitivity analysis: the regulon-activity evidence above uses nominal
+# p < 0.05 in at least one contrast. Here, decoupleR p-values are adjusted
+# with Benjamini-Hochberg within each contrast, to check which candidates
+# retain significant activity after multiple-testing correction.
+# The original selection criteria are NOT changed by this check.
+
+top10 <- c("ZEB2", "RELA", "NFKB1", "SMAD3", "NOTCH1",
+           "GATA2", "LEF1", "NR2F2", "HIPK2", "HEY1")
+
+tf_activity_bh <- tf_activity %>%
+  dplyr::filter(statistic == "ulm") %>%
+  dplyr::group_by(condition) %>%
+  dplyr::mutate(padj = p.adjust(p_value, method = "BH")) %>%
+  dplyr::ungroup()
+
+# Main-pool TFs (n_evidence_types == 3)
+main45 <- evidence_table %>%
+  dplyr::filter(n_evidence_types == 3) %>%
+  dplyr::pull(TF)
+
+bh_summary <- tf_activity_bh %>%
+  dplyr::filter(source %in% main45) %>%
+  dplyr::group_by(source) %>%
+  dplyr::summarise(
+    n_sig_nominal = sum(p_value < 0.05),
+    n_sig_BH      = sum(padj < 0.05),
+    min_padj      = min(padj),
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(main_figure = source %in% top10) %>%
+  dplyr::arrange(dplyr::desc(main_figure), dplyr::desc(n_sig_BH), min_padj)
+
+# Check: main-pool TFs retaining at least one significant contrast after BH
+# (expect 45 in total: 28 TRUE, 17 FALSE)
+cat("Main-pool TFs:", length(main45), "\n")
+print(table(retains_activity_BH = bh_summary$n_sig_BH > 0))
+
+# The 10 main-figure TFs (expect 9 retained; GATA2 not retained, min padj = 0.052)
+bh_summary %>%
+  dplyr::filter(main_figure) %>%
+  print(n = Inf)
+
+write_xlsx(
+  list(
+    "bh_summary_main45"   = bh_summary,
+    "tf_activity_with_BH" = tf_activity_bh
+  ),
+  path = "TF_activity_BH_sensitivity.xlsx"
+)
+cat("Exported TF_activity_BH_sensitivity.xlsx\n")
+```
+## 5C. TF Expression vs. Inferred Regulatory Activity
+
+```{r tf_expression_vs_activity}
+# Compares, for the 45 main-pool TFs (and separately for the 10 main-figure
+# TFs), the trajectory of inferred regulon activity with the expression
+# trajectory of the TF-encoding gene itself.
+#   - Trajectory classes use the same sign-based logic for both layers
+#     (L1 = eMPC vs iPSC, L2 = EC vs eMPC): monotonic_increase (+/+),
+#     monotonic_decrease (-/-), eMPC_peak (+/-), eMPC_trough (-/+).
+#   - Sign agreement is also assessed per contrast (L1, L2, L3).
+#   - Spearman correlation between activity scores and TF log2FC per contrast.
+#   - "Strong" discordance: opposite signs AND significance on both layers in
+#     the same contrast. Primary criterion (consistent with TF selection):
+#     activity nominal p < 0.05; expression adjusted p < 0.05 (BH within the
+#     common universe, without the |log2FC| filter).
+#     Sensitivity criterion: activity BH-adjusted p < 0.05 (tf_activity_bh,
+#     Section 5B); expression criterion unchanged.
+# Discordance is descriptive: TF activity can depend on mechanisms not
+# captured by TF transcript abundance.
+
+library(dplyr)
+library(tidyr)
+
+classify_traj <- function(x1, x2) {
+  dplyr::case_when(
+    x1 > 0 & x2 > 0 ~ "monotonic_increase",
+    x1 < 0 & x2 < 0 ~ "monotonic_decrease",
+    x1 > 0 & x2 < 0 ~ "eMPC_peak",
+    x1 < 0 & x2 > 0 ~ "eMPC_trough",
+    TRUE            ~ NA_character_
+  )
+}
+
+top10 <- c("ZEB2", "RELA", "NFKB1", "SMAD3", "NOTCH1",
+           "GATA2", "LEF1", "NR2F2", "HIPK2", "HEY1")
+
+main45 <- evidence_table %>%
+  dplyr::filter(n_evidence_types == 3) %>%
+  dplyr::pull(TF)
+
+# Activity scores and nominal p-values, one row per TF
+act_wide <- tf_activity %>%
+  dplyr::filter(statistic == "ulm", source %in% main45) %>%
+  dplyr::select(source, condition, score, p_value) %>%
+  tidyr::pivot_wider(names_from = condition, values_from = c(score, p_value))
+
+# BH-adjusted activity p-values (sensitivity), one row per TF
+act_padj_wide <- tf_activity_bh %>%
+  dplyr::filter(source %in% main45) %>%
+  dplyr::select(source, condition, padj) %>%
+  tidyr::pivot_wider(names_from = condition, values_from = padj,
+                     names_prefix = "act_padj_")
+
+# TF-encoding gene expression (log2FC and common-universe adjusted p)
+expr_tf <- wide %>%
+  dplyr::filter(GeneID %in% main45) %>%
+  dplyr::select(GeneID, L1_logFC, L2_logFC, L3_logFC, L1_padj, L2_padj, L3_padj)
+
+tf_expr_act <- act_wide %>%
+  dplyr::inner_join(expr_tf, by = c("source" = "GeneID")) %>%
+  dplyr::left_join(act_padj_wide, by = "source") %>%
+  dplyr::mutate(
+    activity_class   = classify_traj(score_eMPC_vs_iPSC, score_EC_vs_eMPC),
+    expression_class = classify_traj(L1_logFC, L2_logFC),
+    trajectory_concordant = activity_class == expression_class,
+
+    sign_agree_L1 = sign(score_eMPC_vs_iPSC) == sign(L1_logFC),
+    sign_agree_L2 = sign(score_EC_vs_eMPC)   == sign(L2_logFC),
+    sign_agree_L3 = sign(score_EC_vs_iPSC)   == sign(L3_logFC),
+
+    # Primary criterion: activity nominal p < 0.05
+    strong_disc_L1 = !sign_agree_L1 & p_value_eMPC_vs_iPSC < 0.05 & L1_padj < 0.05,
+    strong_disc_L2 = !sign_agree_L2 & p_value_EC_vs_eMPC   < 0.05 & L2_padj < 0.05,
+    strong_disc_L3 = !sign_agree_L3 & p_value_EC_vs_iPSC   < 0.05 & L3_padj < 0.05,
+
+    # Sensitivity criterion: activity BH-adjusted p < 0.05
+    strong_disc_BH_L1 = !sign_agree_L1 & act_padj_eMPC_vs_iPSC < 0.05 & L1_padj < 0.05,
+    strong_disc_BH_L2 = !sign_agree_L2 & act_padj_EC_vs_eMPC   < 0.05 & L2_padj < 0.05,
+    strong_disc_BH_L3 = !sign_agree_L3 & act_padj_EC_vs_iPSC   < 0.05 & L3_padj < 0.05,
+
+    n_contrasts_sign_agree   = sign_agree_L1 + sign_agree_L2 + sign_agree_L3,
+    n_strong_discordances    = strong_disc_L1 + strong_disc_L2 + strong_disc_L3,
+    n_strong_discordances_BH = strong_disc_BH_L1 + strong_disc_BH_L2 + strong_disc_BH_L3,
+    main_figure = source %in% top10
+  ) %>%
+  dplyr::arrange(dplyr::desc(main_figure), source)
+
+# Check: 45 TFs, no missing classes (expect 45 and 0)
+nrow(tf_expr_act)
+sum(is.na(tf_expr_act$activity_class) | is.na(tf_expr_act$expression_class))
+
+# Check: classes match the TF manipulability screening table (expect 0 mismatches)
+screening_file <- "TF_manipulability_screening_2026-09-20.xlsx"
+if (file.exists(screening_file)) {
+  scr <- readxl::read_excel(screening_file) %>%
+    dplyr::filter(!is.na(TF)) %>%
+    dplyr::distinct(TF, regulon_activity_pattern, TF_expression_pattern)
+  chk <- tf_expr_act %>%
+    dplyr::inner_join(scr, by = c("source" = "TF")) %>%
+    dplyr::filter(activity_class != regulon_activity_pattern |
+                  expression_class != TF_expression_pattern)
+  cat("TFs compared with screening table:",
+      dplyr::n_distinct(scr$TF[scr$TF %in% tf_expr_act$source]),
+      "| mismatches:", nrow(chk), "\n")
+  if (nrow(chk) > 0) print(chk[, c("source", "activity_class", "regulon_activity_pattern",
+                                   "expression_class", "TF_expression_pattern")])
+} else {
+  cat("Screening file not found in working directory; class check skipped.\n")
+}
+
+# 1. Trajectory concordance: all 45 and the 10 main-figure TFs
+cat("\nTrajectory concordance (45 main-pool TFs):\n")
+print(table(concordant = tf_expr_act$trajectory_concordant))
+cat("\nTrajectory concordance (10 main-figure TFs):\n")
+print(table(concordant = tf_expr_act$trajectory_concordant[tf_expr_act$main_figure]))
+
+cat("\nActivity class (rows) vs expression class (columns), 45 TFs:\n")
+print(table(activity = tf_expr_act$activity_class,
+            expression = tf_expr_act$expression_class))
+
+# 2. Sign agreement per contrast (number of TFs out of 45)
+cat("\nSign agreement per contrast (45 TFs):\n")
+print(colSums(tf_expr_act[, c("sign_agree_L1", "sign_agree_L2", "sign_agree_L3")]))
+
+# 3. Spearman correlation between activity score and TF log2FC, per contrast
+spearman_tbl <- dplyr::bind_rows(lapply(
+  list(c("score_eMPC_vs_iPSC", "L1_logFC", "eMPC_vs_iPSC"),
+       c("score_EC_vs_eMPC",   "L2_logFC", "EC_vs_eMPC"),
+       c("score_EC_vs_iPSC",   "L3_logFC", "EC_vs_iPSC")),
+  function(v) {
+    ct <- cor.test(tf_expr_act[[v[1]]], tf_expr_act[[v[2]]],
+                   method = "spearman", exact = FALSE)
+    data.frame(contrast = v[3], rho = unname(ct$estimate), p_value = ct$p.value)
+  }
+))
+cat("\nSpearman correlation, activity score vs TF log2FC (45 TFs):\n")
+print(spearman_tbl)
+
+# 4. Strong discordances: primary (nominal) and sensitivity (BH) criteria
+disc_cols <- c("source", "main_figure", "activity_class", "expression_class",
+               "strong_disc_L1", "strong_disc_L2", "strong_disc_L3",
+               "strong_disc_BH_L1", "strong_disc_BH_L2", "strong_disc_BH_L3",
+               "score_eMPC_vs_iPSC", "L1_logFC", "score_EC_vs_eMPC", "L2_logFC",
+               "score_EC_vs_iPSC", "L3_logFC")
+
+strong_disc <- tf_expr_act %>%
+  dplyr::filter(n_strong_discordances > 0) %>%
+  dplyr::select(dplyr::all_of(disc_cols))
+
+# Expect 12 TFs (primary) and 6 TFs (BH: HEY1, HIPK2, NR2F2, HHEX, HOXB3, SNAI1)
+cat("\nTFs with at least one strong discordance (primary, nominal activity p):",
+    nrow(strong_disc), "\n")
+cat("TFs with at least one strong discordance (sensitivity, BH activity p):",
+    sum(tf_expr_act$n_strong_discordances_BH > 0), "\n")
+cat("Main-figure TFs with strong discordance (primary):",
+    paste(strong_disc$source[strong_disc$main_figure], collapse = ", "), "\n")
+cat("Main-figure TFs with strong discordance (BH):",
+    paste(tf_expr_act$source[tf_expr_act$main_figure &
+                             tf_expr_act$n_strong_discordances_BH > 0], collapse = ", "), "\n\n")
+print(strong_disc, n = Inf, width = Inf)
+
+write_xlsx(
+  list(
+    "tf_expression_vs_activity" = tf_expr_act,
+    "spearman_by_contrast"      = spearman_tbl,
+    "strong_discordances"       = strong_disc
+  ),
+  path = "TF_expression_vs_activity.xlsx"
+)
+cat("\nExported TF_expression_vs_activity.xlsx\n")
+```
+
+## 5D. Activity Heatmap of the 10 Representative TFs (Main Figure)
+
+```{r tf_activity_heatmap_top10, fig.width=6.5, fig.height=4.2}
+# Heatmap of inferred regulon activity (decoupleR ulm scores, CollecTRI) for
+# the 10 representative TFs across the three backbone contrasts.
+# Style follows the module-score heatmap (Molecular Signatures, Section 4.6.1).
+#   - Rows grouped by assigned stage (iPSC, eMPC, EC), in the same order as
+#     the integrated timeline figure. Stage assignment follows the rule
+#     applied in the IntegratedTimeline Rmd: eMPC_peak -> eMPC;
+#     monotonic_increase -> EC; monotonic_decrease -> iPSC; eMPC_trough ->
+#     EC or iPSC according to the sign of the EC vs iPSC activity score.
+#   - Cell values: activity score; "*" nominal p < 0.05; "**" also
+#     BH-adjusted p < 0.05 (Section 5B).
+#   - Right-hand text: expression trajectory of the TF-encoding gene
+#     (Section 5C), with the same class names as the appendix table.
+#     The "TF expression" header is drawn with decorate_annotation(), as the
+#     annotation name is not displayed when column names are on top.
+
+library(ComplexHeatmap)
+library(circlize)
+library(grid)
+
+top10_order <- c("HEY1", "HIPK2",                     # iPSC
+                 "LEF1", "NR2F2",                     # eMPC
+                 "ZEB2", "SMAD3", "RELA", "NOTCH1", "NFKB1", "GATA2")  # EC
+contrast_order  <- c("eMPC_vs_iPSC", "EC_vs_eMPC", "EC_vs_iPSC")
+contrast_labels <- c("eMPC vs iPSC", "EC vs eMPC", "EC vs iPSC")
+
+hm_df <- tf_expr_act %>%
+  dplyr::filter(source %in% top10_order) %>%
+  dplyr::mutate(
+    assigned_stage = dplyr::case_when(
+      activity_class == "eMPC_peak"                          ~ "eMPC",
+      activity_class == "monotonic_increase"                 ~ "EC",
+      activity_class == "monotonic_decrease"                 ~ "iPSC",
+      activity_class == "eMPC_trough" & score_EC_vs_iPSC > 0 ~ "EC",
+      activity_class == "eMPC_trough" & score_EC_vs_iPSC < 0 ~ "iPSC",
+      TRUE ~ NA_character_
+    ),
+    source = factor(source, levels = top10_order)
+  ) %>%
+  dplyr::arrange(source)
+
+# Check: stage assignment matches the IntegratedTimeline Rmd (expect no error)
+expected_stage <- c(HEY1 = "iPSC", HIPK2 = "iPSC", LEF1 = "eMPC", NR2F2 = "eMPC",
+                    ZEB2 = "EC", SMAD3 = "EC", RELA = "EC", NOTCH1 = "EC",
+                    NFKB1 = "EC", GATA2 = "EC")
+stopifnot(nrow(hm_df) == 10,
+          all(hm_df$assigned_stage == expected_stage[as.character(hm_df$source)]))
+
+# Matrices: scores, nominal p, BH-adjusted p
+score_mat <- as.matrix(hm_df[, paste0("score_", contrast_order)])
+p_mat     <- as.matrix(hm_df[, paste0("p_value_", contrast_order)])
+padj_mat  <- as.matrix(hm_df[, paste0("act_padj_", contrast_order)])
+rownames(score_mat) <- as.character(hm_df$source)
+colnames(score_mat) <- contrast_labels
+
+sig_mat  <- ifelse(padj_mat < 0.05, "**", ifelse(p_mat < 0.05, "*", ""))
+cell_lab <- matrix(paste0(sprintf("%.1f", score_mat), sig_mat),
+                   nrow = nrow(score_mat), dimnames = dimnames(score_mat))
+
+# Expression trajectory of the TF-encoding gene (same names as Table A.3)
+expr_text <- unname(c(monotonic_increase = "monotonic increase",
+                      monotonic_decrease = "monotonic decrease",
+                      eMPC_peak          = "eMPC peak",
+                      eMPC_trough        = "eMPC trough")[hm_df$expression_class])
+
+right_ha <- rowAnnotation(
+  tf_expr = anno_text(
+    expr_text,
+    gp = gpar(fontsize = 8, col = "grey30"),
+    location = 0, just = "left",
+    width = max_text_width(expr_text, gp = gpar(fontsize = 8)) + unit(2, "mm")
+  ),
+  show_annotation_name = FALSE
+)
+
+max_abs <- max(abs(score_mat))
+col_fun <- colorRamp2(c(-max_abs, 0, max_abs), c("#2166AC", "white", "#B2182B"))
+
+ht_top10 <- Heatmap(
+  score_mat,
+  name = "Activity\nscore",
+  col = col_fun,
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  row_split = factor(hm_df$assigned_stage, levels = c("iPSC", "eMPC", "EC")),
+  row_title_rot = 0,
+  row_title_gp = gpar(fontsize = 8, fontface = "bold", col = "grey30"),
+  row_gap = unit(1.5, "mm"),
+  row_names_side = "left",
+  row_names_gp = gpar(fontsize = 8),
+  column_names_side = "top",
+  column_names_rot = 0,
+  column_names_centered = TRUE,
+  column_names_gp = gpar(fontsize = 8, fontface = "bold"),
+  width  = unit(3 * 22, "mm"),
+  height = unit(10 * 6.5, "mm"),
+  rect_gp = gpar(col = "white", lwd = 1),
+  border = TRUE,
+  right_annotation = right_ha,
+  heatmap_legend_param = list(
+    title_gp  = gpar(fontsize = 8, fontface = "bold"),
+    labels_gp = gpar(fontsize = 8),
+    legend_height = unit(25, "mm")
+  ),
+  cell_fun = function(j, i, x, y, width, height, fill) {
+    grid.text(cell_lab[i, j], x, y, gp = gpar(fontsize = 8))
+  }
+)
+
+# Extra top margin for the header (order: bottom, left, top, right)
+draw(ht_top10, padding = unit(c(2, 2, 6, 2), "mm"))
+
+# "TF expression" header above the right-hand annotation, aligned with the
+# column names (drawn on the first row slice, the top of the annotation)
+decorate_annotation("tf_expr", slice = 1, {
+  grid.text("TF expression",
+            x = unit(0, "npc"), y = unit(1, "npc") + unit(1.5, "mm"),
+            just = c("left", "bottom"),
+            gp = gpar(fontsize = 8, fontface = "bold"))
+})
+```
+
+# 6. Export Results
+
+```{r export_results}
+write_xlsx(
+  list(
+    "tf_evidence_table" = evidence_table,
+    "tf_activity_full"   = tf_activity
+  ),
+  path = "TF_track_evidence_table.xlsx"
+)
+
+cat("Exported TF_track_evidence_table.xlsx —", nrow(evidence_table), "candidate TFs\n")
+```
+
+# 3B. Filter to Known Transcription Factors — Sensitivity (Broad DEG Pool)
+
+```{r combine_pools_2b}
+# Sensitivity version of Section 2's combined_pool, using deg_pool_broad
+# (padj<0.05 only, no |log2FC|>=1 threshold) instead of the main
+# deg_pool. Compares against the main analysis to check whether TFs
+# with high n_evidence_types under the strict pool retain that status
+# when genes with padj<0.05 but modest fold-change are included.
+
+combined_pool_2b <- union(deg_pool_broad, leading_edge_pool)
+
+cat("DEG pool (broad):", length(deg_pool_broad), "\n")
+cat("Leading edge pool:", length(leading_edge_pool), "\n")
+cat("Combined pool (union, broad):", length(combined_pool_2b), "\n")
+```
+
+```{r filter_pool_to_tfs_2b}
+candidate_tfs_2b <- intersect(combined_pool_2b, tf_catalogue)
+
+cat("Combined pool genes that are known TFs (broad, CollecTRI):", length(candidate_tfs_2b), "\n")
+```
+
+```{r evidence_scoring_2b}
+# Reuses tf_activity_sig from the main run (Section 5) — regulon
+# activity does not depend on the DEG pool definition, only the DEG
+# membership check (is_deg) does.
+
+evidence_table_2b <- data.frame(TF = candidate_tfs_2b) %>%
+  dplyr::mutate(
+    is_deg              = TF %in% deg_pool_broad,
+    is_leading_edge      = TF %in% leading_edge_pool,
+    has_regulon_activity = TF %in% tf_activity_sig$source,
+    n_evidence_types      = is_deg + is_leading_edge + has_regulon_activity
+  ) %>%
+  dplyr::left_join(tf_activity_sig, by = c("TF" = "source")) %>%
+  dplyr::arrange(dplyr::desc(n_evidence_types))
+
+cat("=== Evidence score distribution (broad pool) ===\n")
+print(table(evidence_table_2b$n_evidence_types))
+```
+
+```{r compare_main_vs_broad}
+# Direct comparison: which TFs had n_evidence_types == 3 in the main
+# (strict) analysis, and do they retain that status in the broad
+# sensitivity pool?
+
+main_top <- evidence_table %>% dplyr::filter(n_evidence_types == 3) %>% dplyr::pull(TF)
+broad_status_of_main_top <- evidence_table_2b %>%
+  dplyr::filter(TF %in% main_top) %>%
+  dplyr::select(TF, n_evidence_types)
+
+cat("Main-analysis top TFs (n_evidence_types==3):", length(main_top), "\n")
+cat("Of these, how many keep n_evidence_types==3 in the broad pool:",
+    sum(broad_status_of_main_top$n_evidence_types == 3), "\n\n")
+
+print(broad_status_of_main_top)
+
+# New TFs that reach n_evidence_types==3 only under the broad pool
+# (i.e. would have been missed by the stricter main analysis)
+broad_only_top <- evidence_table_2b %>%
+  dplyr::filter(n_evidence_types == 3, !TF %in% main_top) %>%
+  dplyr::pull(TF)
+
+cat("\nTFs reaching n_evidence_types==3 only in the broad pool:", length(broad_only_top), "\n")
+print(broad_only_top)
+```
+
+# 7. Export Sensitivity Analysis Results
+
+```{r export_sensitivity}
+# Export the sensitivity analysis outputs separately: the broad-pool
+# evidence table, and the comparison between main and broad pool top
+# candidates (n_evidence_types == 3).
+
+write_xlsx(
+  list(
+    "evidence_table_broad"     = evidence_table_2b,
+    "main_vs_broad_comparison" = broad_status_of_main_top,
+    "broad_only_new_top_tfs"   = data.frame(TF = broad_only_top)
+  ),
+  path = "TF_track_sensitivity_analysis.xlsx"
+)
+
+cat("Exported TF_track_sensitivity_analysis.xlsx\n")
+cat("  - evidence_table_broad:", nrow(evidence_table_2b), "rows\n")
+cat("  - main_vs_broad_comparison:", nrow(broad_status_of_main_top), "rows\n")
+cat("  - broad_only_new_top_tfs:", length(broad_only_top), "rows\n")
+```
+
+# 8. Assign Trajectory Class to Top Candidate TFs
+
+```{r tf_trajectory_class}
+# Classify trajectory shape for the main-pool top TFs AND the
+# broad-pool-only TFs (Section 3B), marked separately via source_pool,
+# since the latter reached n_evidence_types==3 only under the relaxed
+# |log2FC| threshold and should not be silently merged with the main 45.
+# Kept consistent with the gene-level trajectory_sign_class logic
+# (Molecular_Signatures.Rmd) for visual consistency across the
+# integrated timeline figure.
+
+top_tfs_main  <- evidence_table %>% dplyr::filter(n_evidence_types == 3) %>% dplyr::pull(TF)
+top_tfs_all   <- union(top_tfs_main, broad_only_top)
+
+tf_activity_wide <- tf_activity %>%
+  dplyr::filter(statistic == "ulm", source %in% top_tfs_all) %>%
+  dplyr::select(source, condition, score) %>%
+  tidyr::pivot_wider(names_from = condition, values_from = score)
+
+tf_trajectory <- tf_activity_wide %>%
+  dplyr::mutate(
+    trajectory_class = dplyr::case_when(
+      eMPC_vs_iPSC > 0 & EC_vs_eMPC > 0 ~ "monotonic_increase",
+      eMPC_vs_iPSC < 0 & EC_vs_eMPC < 0 ~ "monotonic_decrease",
+      eMPC_vs_iPSC > 0 & EC_vs_eMPC < 0 ~ "eMPC_peak",
+      eMPC_vs_iPSC < 0 & EC_vs_eMPC > 0 ~ "eMPC_trough",
+      TRUE ~ "other"
+    ),
+    source_pool = ifelse(source %in% top_tfs_main, "main", "broad-only")
+  )
+
+cat("=== TF trajectory class distribution ===\n")
+print(table(tf_trajectory$trajectory_class, tf_trajectory$source_pool))
+print(as.data.frame(tf_trajectory))
+```
+
+# 9. Export TF Trajectory Table
+```{r export_tf_trajectory}
+write_xlsx(
+  list("tf_trajectory" = tf_trajectory),
+  path = "TF_track_trajectory.xlsx"
+)
+cat("Exported TF_track_trajectory.xlsx —", nrow(tf_trajectory), "TFs\n")
+```
+
+# 10. Load DoRothEA Regulon (Cross-Check)
+
+```{r load_dorothea_diagnostic}
+dorothea_raw <- read.csv(
+  "https://omnipathdb.org/interactions?datasets=dorothea&genesymbols=1&fields=dorothea_level",
+  sep = "\t"
+)
+
+cat("Rows retrieved:", nrow(dorothea_raw), "\n")
+print(colnames(dorothea_raw))
+head(dorothea_raw)
+```
+
+```{r load_dorothea_build}
+# (note: confirm against the output of the chunk above before running —
+# in particular whether the confidence column is literally named
+# "dorothea_level", and whether consensus_stimulation/consensus_inhibition
+# are present with the same "True"/"False" string format used for
+# CollecTRI in Section 3. Adjust column names below if they differ.)
+dorothea_net <- dorothea_raw %>%
+  dplyr::filter(dorothea_level %in% c("A", "B")) %>%
+  dplyr::filter(consensus_stimulation == "True" | consensus_inhibition == "True") %>%
+  dplyr::mutate(
+    mor = dplyr::case_when(
+      consensus_stimulation == "True" & consensus_inhibition == "False" ~ 1,
+      consensus_inhibition == "True" & consensus_stimulation == "False" ~ -1,
+      TRUE ~ NA_real_
+    )
+  ) %>%
+  dplyr::filter(!is.na(mor)) %>%
+  dplyr::select(source = source_genesymbol, target = target_genesymbol, mor) %>%
+  dplyr::distinct(source, target, .keep_all = TRUE)
+
+cat("DoRothEA regulon (A+B) — TFs:", dplyr::n_distinct(dorothea_net$source), "\n")
+cat("DoRothEA regulon (A+B) — TF-target edges:", nrow(dorothea_net), "\n")
+```
+
+## 10.1 Filter to Known Transcription Factors — DoRothEA
+
+```{r filter_dorothea_tfs}
+# Mirrors Section 3's CollecTRI intersection, same combined_pool.
+tf_catalogue_dorothea <- unique(dorothea_net$source)
+candidate_tfs_dorothea <- intersect(combined_pool, tf_catalogue_dorothea)
+
+cat("Combined pool genes that are known TFs (DoRothEA A+B):",
+    length(candidate_tfs_dorothea), "\n")
+```
+
+# 11. Load AnimalTFDB4 Human TF List (Cross-Check)
+
+```{r load_animaltfdb}
+# The AnimalTFDB4 download is not separable by species at source (183
+# animal genomes in one file) — filtering to human happens here.
+# Columns per the downloaded file header: Species, Symbol, Ensembl,
+# Family, Protein, Entrez_ID (tab-separated .txt).
+animaltfdb_raw <- read.delim(
+  "all_tf_list.txt",
+  header = TRUE, stringsAsFactors = FALSE, quote = ""
+)
+
+cat("AnimalTFDB4 file — columns:\n")
+print(colnames(animaltfdb_raw))
+cat("AnimalTFDB4 file — total rows (all 183 species):", nrow(animaltfdb_raw), "\n")
+
+# Inspect the exact human species string before filtering — do not assume
+# "Homo_sapiens" is spelled/formatted exactly that way in this file.
+cat("Species values matching 'sapiens':\n")
+print(unique(animaltfdb_raw$Species[grepl("sapiens", animaltfdb_raw$Species, ignore.case = TRUE)]))
+```
+
+Run the chunk above first and confirm the printed species string. Update `human_species_string` below to match exactly, then continue.
+
+```{r filter_animaltfdb_human}
+human_species_string <- "Homo_sapiens"
+
+animaltfdb_human <- animaltfdb_raw %>%
+  dplyr::filter(Species == human_species_string)
+
+cat("AnimalTFDB4 — human TF entries:", nrow(animaltfdb_human), "\n")
+
+has_symbol <- !is.na(animaltfdb_human$Symbol) & animaltfdb_human$Symbol != ""
+cat("AnimalTFDB4 — human TF entries with a gene symbol:", sum(has_symbol), "\n")
+cat("AnimalTFDB4 — human TF entries without a gene symbol (Ensembl ID only, excluded from symbol-level comparison):",
+    sum(!has_symbol), "\n")
+```
+
+
+## 11.1 Filter to Known Transcription Factors — AnimalTFDB4
+
+```{r filter_animaltfdb_tfs}
+# Case sensitivity check: AnimalTFDB4 gene symbols for non-human species
+# are lowercase by convention (confirmed from the downloaded file); human
+# symbols are expected uppercase, matching combined_pool, but this is
+# verified here rather than assumed.
+raw_symbols <- animaltfdb_human$Symbol[has_symbol]
+cat("Example symbols as stored:", paste(head(raw_symbols, 10), collapse = ", "), "\n")
+
+tf_catalogue_animaltfdb <- unique(toupper(raw_symbols))
+candidate_tfs_animaltfdb <- intersect(combined_pool, tf_catalogue_animaltfdb)
+
+cat("Combined pool genes that are known TFs (AnimalTFDB4, human, symbol-matched):",
+    length(candidate_tfs_animaltfdb), "\n")
+```
+
+# 12. Three-Way TF Catalogue Comparison (Identity Level)
+
+## 12.1 Catalogue Coverage per Resource
+```{r catalogue_comparison_threeway}
+# Answers: how many TFs each resource identifies within combined_pool,
+# and how much overlap exists between the three. This level does not use
+# run_ulm() — it only checks catalogue membership (candidate_tfs from
+# Section 3 = CollecTRI).
+catalogue_comparison <- data.frame(TF = combined_pool) %>%
+  dplyr::mutate(
+    in_collectri  = TF %in% candidate_tfs,
+    in_dorothea   = TF %in% candidate_tfs_dorothea,
+    in_animaltfdb = TF %in% candidate_tfs_animaltfdb
+  ) %>%
+  dplyr::filter(in_collectri | in_dorothea | in_animaltfdb) %>%
+  dplyr::mutate(n_resources = in_collectri + in_dorothea + in_animaltfdb)
+
+cat("=== TF catalogue coverage within combined_pool ===\n")
+cat("CollecTRI:   ", sum(catalogue_comparison$in_collectri), "\n")
+cat("DoRothEA:    ", sum(catalogue_comparison$in_dorothea), "\n")
+cat("AnimalTFDB4: ", sum(catalogue_comparison$in_animaltfdb), "\n")
+print(table(catalogue_comparison$n_resources))
+
+# Restrict to the 45 main candidates (n_evidence_types == 3, Section 5/9)
+main46_catalogue_check <- catalogue_comparison %>% dplyr::filter(TF %in% main_top)
+cat("\nOf the 45 main candidates:\n")
+n_main <- length(main_top)
+
+cat(" - in CollecTRI:  ", sum(main46_catalogue_check$in_collectri), "/", n_main, "\n")
+cat(" - in DoRothEA:   ", sum(main46_catalogue_check$in_dorothea), "/", n_main, "\n")
+cat(" - in AnimalTFDB4:", sum(main46_catalogue_check$in_animaltfdb), "/", n_main, "\n")
+# Restrict to the 10 main-figure TFs
+main_figure_tfs <- c("ZEB2", "RELA", "NFKB1", "SMAD3", "LEF1",
+                      "HIPK2", "NR2F2", "HEY1", "GATA2", "NOTCH1")
+main_figure_catalogue_check <- catalogue_comparison %>% dplyr::filter(TF %in% main_figure_tfs)
+print(main_figure_catalogue_check)
+```
+
+## 12.2 Overlap Pattern Breakdown
+
+```{r overlap_pattern_breakdown}
+# Full Venn-style breakdown of catalogue_comparison — no new
+# data needed, just decomposing the three logical columns into all
+# possible combinations.
+catalogue_comparison <- catalogue_comparison %>%
+  dplyr::mutate(
+    overlap_pattern = dplyr::case_when(
+      in_collectri & in_dorothea & in_animaltfdb   ~ "CollecTRI + DoRothEA + AnimalTFDB4",
+      in_collectri & in_dorothea & !in_animaltfdb  ~ "CollecTRI + DoRothEA only",
+      in_collectri & !in_dorothea & in_animaltfdb  ~ "CollecTRI + AnimalTFDB4 only",
+      !in_collectri & in_dorothea & in_animaltfdb  ~ "DoRothEA + AnimalTFDB4 only",
+      in_collectri & !in_dorothea & !in_animaltfdb ~ "CollecTRI only",
+      !in_collectri & in_dorothea & !in_animaltfdb ~ "DoRothEA only",
+      !in_collectri & !in_dorothea & in_animaltfdb ~ "AnimalTFDB4 only",
+      TRUE ~ "none"
+    )
+  )
+
+cat("=== Overlap pattern across the three resources ===\n")
+
+result_overlap <- catalogue_comparison %>%
+  dplyr::count(overlap_pattern, name = "n") %>%
+  dplyr::arrange(dplyr::desc(n)) %>%
+  as.data.frame()
+
+print(result_overlap)
+```
+## 12.3 Applicable Evidence for AnimalTFDB4-Only TFs
+
+```{r evidence_animaltfdb_only}
+# For AnimalTFDB4-only TFs, regulon activity
+# cannot be computed — these genes are absent from both the CollecTRI
+# and DoRothEA catalogues, so no TF-target regulon exists to test. The
+# applicable evidence ceiling is therefore 2 (is_deg + is_leading_edge),
+# not 3 — a resource limitation, not evidence of weaker candidacy.
+animaltfdb_only_tfs <- catalogue_comparison %>%
+  dplyr::filter(overlap_pattern == "AnimalTFDB4 only") %>%
+  dplyr::pull(TF)
+
+evidence_table_animaltfdb_only <- data.frame(TF = animaltfdb_only_tfs) %>%
+  dplyr::mutate(
+    is_deg = TF %in% deg_pool,
+    is_leading_edge = TF %in% leading_edge_pool,
+    n_applicable_evidence_types = is_deg + is_leading_edge
+  ) %>%
+  dplyr::arrange(dplyr::desc(n_applicable_evidence_types))
+
+cat("=== AnimalTFDB4-only TFs (n =", length(animaltfdb_only_tfs), ") — applicable evidence (max 2, regulon activity not applicable) ===\n")
+evidence_summary_animaltfdb_only <- evidence_table_animaltfdb_only %>%
+  dplyr::count(n_applicable_evidence_types, name = "n") %>%
+  as.data.frame()
+print(evidence_summary_animaltfdb_only)
+
+strong_animaltfdb_only <- evidence_table_animaltfdb_only %>%
+  dplyr::filter(n_applicable_evidence_types == 2)
+cat("\nAnimalTFDB4-only TFs with BOTH is_deg and is_leading_edge (2/2):", nrow(strong_animaltfdb_only), "\n")
+print(strong_animaltfdb_only)
+```
+
+# 13. DoRothEA TF Activity Scoring (decoupleR)
+
+```{r run_ulm_dorothea}
+# Mirrors Section 4's CollecTRI run: same mat_t input (t-statistics,
+# backbone eBayes fit), same minsize = 5.
+tf_activity_dorothea <- decoupleR::run_ulm(
+  mat = mat_t,
+  network = dorothea_net,
+  .source = "source",
+  .target = "target",
+  .mor = "mor",
+  minsize = 5
+)
+
+cat("DoRothEA TF activity estimates:", nrow(tf_activity_dorothea), "\n")
+
+# TFs among the main candidates with no DoRothEA activity estimate
+# (regulon below minsize = 5 in mat_t, or absent from the A+B catalogue)
+missing_from_dorothea <- setdiff(main_top, unique(tf_activity_dorothea$source))
+cat("Main-45 TFs without a DoRothEA activity estimate:", length(missing_from_dorothea), "\n")
+print(missing_from_dorothea)
+```
+
+# 14. CollecTRI vs DoRothEA Activity Comparison
+
+```{r compare_collectri_dorothea}
+# Direction and magnitude agreement, restricted to the main candidates
+# that have an estimate from both resources. Genes without a DoRothEA
+# activity estimate are silently
+# dropped here by the inner_join — expected, not an error.
+activity_compare <- tf_activity %>%
+  dplyr::filter(statistic == "ulm", source %in% main_top) %>%
+  dplyr::select(source, condition, score_collectri = score) %>%
+  dplyr::inner_join(
+    tf_activity_dorothea %>%
+      dplyr::filter(statistic == "ulm", source %in% main_top) %>%
+      dplyr::select(source, condition, score_dorothea = score),
+    by = c("source", "condition")
+  ) %>%
+  dplyr::mutate(same_direction = sign(score_collectri) == sign(score_dorothea))
+
+cat("=== CollecTRI vs DoRothEA activity — 45 main TFs ===\n")
+cat("TFs compared:", dplyr::n_distinct(activity_compare$source), "\n")
+cat("Contrast-TF pairs compared:", nrow(activity_compare), "\n")
+cat("Same direction:", sum(activity_compare$same_direction), "/", nrow(activity_compare), "\n")
+
+activity_correlation <- cor(activity_compare$score_collectri,
+                             activity_compare$score_dorothea, method = "pearson")
+cat("Pearson correlation (CollecTRI score vs DoRothEA score):", round(activity_correlation, 3), "\n")
+
+# Same check restricted to the 10 main-figure TFs
+main_figure_tfs <- c("ZEB2", "RELA", "NFKB1", "SMAD3", "LEF1",
+                      "HIPK2", "NR2F2", "HEY1", "GATA2", "NOTCH1")
+activity_compare_mainfig <- activity_compare %>% dplyr::filter(source %in% main_figure_tfs)
+print(activity_compare_mainfig)
+```
+
+# 15. Export Cross-Check Results
+
+```{r export_crosscheck_results}
+write_xlsx(
+  list(
+    "catalogue_comparison_full"    = catalogue_comparison,
+    "catalogue_comparison_main46"  = main46_catalogue_check,
+    "catalogue_comparison_mainfig" = main_figure_catalogue_check,
+    "overlap_pattern_summary"      = result_overlap,
+    "animaltfdb_only_evidence"     = evidence_table_animaltfdb_only,
+    "activity_compare_main46"      = activity_compare,
+    "activity_compare_mainfig"     = activity_compare_mainfig,
+    "missing_from_dorothea"        = data.frame(TF = missing_from_dorothea)
+  ),
+  path = "TF_track_crosscheck_dorothea_animaltfdb.xlsx"
+)
+cat("Exported TF_track_crosscheck_dorothea_animaltfdb.xlsx\n")
+```

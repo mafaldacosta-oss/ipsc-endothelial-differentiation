@@ -1,0 +1,1872 @@
+---
+title: "DEGs & GSEA"
+output:
+  pdf_document:
+        latex_engine: xelatex
+  html_document: default
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(fig.path = "figures/", dev = c("png", "pdf"), dpi = 300)
+```
+
+```{r libraries, message=FALSE}
+# Load required libraries
+library(limma)      # differential expression
+library(dplyr)      # data manipulation
+library(ggplot2)    # plotting
+library(ggpubr)     # arranging plots
+library(writexl)    # export to Excel
+library(msigdbr)    # gene set databases (MSigDB)
+library(fgsea)      # gene set enrichment analysis
+library(stringr)    # string manipulation for plot labels
+```
+
+```{r resolve_function_conflicts}
+# Several functions used in this Rmd share their names with functions from
+# other loaded packages (e.g. S4Vectors::rename, igraph::simplify,
+# AnnotationDbi::select). Defining them here ensures the intended versions
+# are always used, regardless of package loading order in the session.
+# This does not change any analysis: these are the functions the code
+# was written for.
+
+select    <- dplyr::select
+rename    <- dplyr::rename
+mutate    <- dplyr::mutate
+filter    <- dplyr::filter
+simplify  <- clusterProfiler::simplify
+```
+
+```{r setup_dir}
+# Set working directory — all input/output files are read/written here
+setwd("~/Desktop/Tese/R/Transcriptomic analysis")
+```
+
+# 1. Load Backbone Objects
+
+```{r load_objects}
+# Load the full topTable outputs produced by the backbone pipeline. These contain all 
+# genes tested, with logFC, t-statistic, p-values, etc. They are the starting point for 
+# all downstream analysis in this markdown.
+
+DEGenes_iPSC_eMPC_backbone <- readRDS("DEGenes_iPSC_eMPC_backbone.rds")
+DEGenes_eMPC_EC_backbone   <- readRDS("DEGenes_eMPC_EC_backbone.rds")
+DEGenes_iPSC_EC_backbone   <- readRDS("DEGenes_iPSC_EC_backbone.rds")
+```
+
+# 2. DEG Filtering
+
+```{r deg_filter}
+# Filter genes by statistical and biological significance thresholds:
+# - adj.P.Val < 0.05: FDR-adjusted p-value (controls false discovery rate)
+# - |logFC| >= 1: at least 2-fold change in expression (log2 scale)
+
+# eMPC vs iPSC (mesoderm induction step)
+DEGs_eMPC_vs_iPSC_backbone <- DEGenes_iPSC_eMPC_backbone %>%
+  filter(adj.P.Val < 0.05, abs(logFC) >= 1)
+
+# EC vs eMPC (endothelial specification step)
+DEGs_EC_vs_eMPC_backbone <- DEGenes_eMPC_EC_backbone %>%
+  filter(adj.P.Val < 0.05, abs(logFC) >= 1)
+
+# EC vs iPSC (full differentiation trajectory)
+DEGs_EC_vs_iPSC_backbone <- DEGenes_iPSC_EC_backbone %>%
+  filter(adj.P.Val < 0.05, abs(logFC) >= 1)
+
+# Print number of DEGs per contrast
+cat("DEGs eMPC vs iPSC:", nrow(DEGs_eMPC_vs_iPSC_backbone), "\n")
+cat("DEGs EC vs eMPC:",   nrow(DEGs_EC_vs_eMPC_backbone),   "\n")
+cat("DEGs EC vs iPSC:",   nrow(DEGs_EC_vs_iPSC_backbone),   "\n")
+```
+
+# 3. Volcano Plots
+
+```{r volcano_plots, fig.width=15, fig.height=5}
+
+# Add a significance category column to each topTable. This is used to colour points 
+# in the volcano plot:
+# Up = significantly upregulated in the later stage
+# Down = significantly downregulated in the later stage
+# NS = not significant
+
+add_sig_category <- function(df) {
+  df$category <- "NS"
+  df$category[df$adj.P.Val < 0.05 & df$logFC >=  1] <- "Up"
+  df$category[df$adj.P.Val < 0.05 & df$logFC <= -1] <- "Down"
+  df$category <- factor(df$category, levels = c("Up", "Down", "NS"))
+  return(df)
+}
+
+# Apply to full topTables (not the filtered DEGs)
+vol_eMPC_vs_iPSC_backbone <- add_sig_category(DEGenes_iPSC_eMPC_backbone)
+vol_EC_vs_eMPC_backbone   <- add_sig_category(DEGenes_eMPC_EC_backbone)
+vol_EC_vs_iPSC_backbone   <- add_sig_category(DEGenes_iPSC_EC_backbone)
+
+# Colour palette: red = upregulated, blue = downregulated, grey = NS
+vol_colours <- c("Up" = "#B2182B", "Down" = "#2166AC", "NS" = "grey70")
+
+# Volcano plot function
+# x-axis: log2 fold change (effect size)
+# y-axis: -log10(adj.P.Val) (statistical significance)
+# Dashed lines mark the thresholds used for DEG filtering
+plot_volcano_backbone <- function(df, title) {
+  ggplot(df, aes(x = logFC, y = -log10(adj.P.Val), colour = category)) +
+    geom_point(alpha = 0.5, size = 1.2) +
+    scale_colour_manual(values = vol_colours, name = NULL) +
+    geom_vline(xintercept = c(-1, 1),
+               linetype = "dashed", colour = "black", linewidth = 0.4) +
+    geom_hline(yintercept = -log10(0.05),
+               linetype = "dashed", colour = "black", linewidth = 0.4) +
+    labs(
+      title = title,
+      x     = "log2 Fold Change",
+      y     = expression(-log[10](adj.P.Val))
+    ) +
+    theme_bw() +
+    theme(
+      axis.line        = element_line(colour = "black"),
+      panel.grid.minor = element_blank(),
+      panel.border     = element_blank(),
+      panel.background = element_blank(),
+      plot.title       = element_text(hjust = 0.5, size = 12)
+    )
+}
+
+# Generate one plot per contrast
+p_vol_eMPC_vs_iPSC_backbone <- plot_volcano_backbone(
+  vol_eMPC_vs_iPSC_backbone, "eMPC vs iPSC (Day 3 vs Day 0)")
+
+p_vol_EC_vs_eMPC_backbone <- plot_volcano_backbone(
+  vol_EC_vs_eMPC_backbone, "EC vs eMPC (Day 11 vs Day 3)")
+
+p_vol_EC_vs_iPSC_backbone <- plot_volcano_backbone(
+  vol_EC_vs_iPSC_backbone, "EC vs iPSC (Day 11 vs Day 0)")
+
+# Display side by side with shared legend
+ggarrange(p_vol_eMPC_vs_iPSC_backbone,
+          p_vol_EC_vs_eMPC_backbone,
+          p_vol_EC_vs_iPSC_backbone,
+          ncol = 3, nrow = 1,
+          common.legend = TRUE, legend = "bottom")
+```
+
+# 4. Export Filtered DEG Lists
+
+```{r export_degs}
+# Export the filtered DEG lists to a single Excel file with one sheet per contrast. 
+# Genes are ranked by logFC (descending) - most upregulated in later stage first.
+
+write_xlsx(
+  list(
+    "eMPC_vs_iPSC" = DEGs_eMPC_vs_iPSC_backbone[
+      order(DEGs_eMPC_vs_iPSC_backbone$logFC, decreasing = TRUE), ],
+    "EC_vs_eMPC"   = DEGs_EC_vs_eMPC_backbone[
+      order(DEGs_EC_vs_eMPC_backbone$logFC, decreasing = TRUE), ],
+    "EC_vs_iPSC"   = DEGs_EC_vs_iPSC_backbone[
+      order(DEGs_EC_vs_iPSC_backbone$logFC, decreasing = TRUE), ]
+  ),
+  path = "DEGs_backbone.xlsx"
+)
+```
+
+# 5. Gene Set Enrichment Analysis (GSEA) — Backbone Only
+
+## 5.1 Prepare Ranked Gene Lists
+
+```{r gsea_ranked}
+# prepare_rank: creates a named numeric vector of t-statistics for all genes,
+# sorted in decreasing order — this is the input format required by fgsea.
+#
+# Why t-statistic instead of logFC? The t-statistic incorporates both effect size 
+# and variance:genes with high logFC but high variability across replicates are penalised. 
+# This makes it a more robust ranking metric for GSEA.
+
+# All genes are included — no significance filter is applied at this stage.
+# GSEA tests whether gene sets are enriched at the top or bottom of the ranking,
+# so it requires the full ranked list, not just significant genes.
+
+prepare_rank <- function(df) {
+  rank <- df$t
+  names(rank) <- df$GeneID
+  
+  # Remove genes with missing names, missing t-statistics, or non-finite values
+  rank <- rank[!is.na(names(rank))]
+  rank <- rank[!is.na(rank)]
+  rank <- rank[is.finite(rank)]
+  
+  # If a gene appears more than once, keep only the entry with the largest |t|
+  rank <- rank[order(abs(rank), decreasing = TRUE)]
+  rank <- rank[!duplicated(names(rank))]
+  
+  # Sort descending for fgsea input
+  rank <- sort(rank, decreasing = TRUE)
+  
+  return(rank)
+}
+
+# Create ranked lists for each contrast
+rank_eMPC_vs_iPSC_backbone <- prepare_rank(DEGenes_iPSC_eMPC_backbone)
+rank_EC_vs_eMPC_backbone   <- prepare_rank(DEGenes_eMPC_EC_backbone)
+rank_EC_vs_iPSC_backbone   <- prepare_rank(DEGenes_iPSC_EC_backbone)
+
+# Verify gene counts
+cat("Genes ranked - eMPC vs iPSC:", length(rank_eMPC_vs_iPSC_backbone), "\n")
+cat("Genes ranked - EC vs eMPC:",   length(rank_EC_vs_eMPC_backbone),   "\n")
+cat("Genes ranked - EC vs iPSC:",   length(rank_EC_vs_iPSC_backbone),   "\n")
+```
+
+## 5.2 Load Gene Sets
+
+```{r load_genesets}
+# Load gene sets from MSigDB via the msigdbr package
+
+# GO Biological Process (main analysis):
+# Large collection (~7000 gene sets) of curated biological processes from Gene Ontology.
+# Used as the primary collection to characterise the biological meaning of each contrast.
+
+# Hallmark (supporting analysis):
+# 50 well-defined, non-redundant gene sets representing hallmark biological states.
+# Used as a cleaner, higher-level summary of the GO BP results.
+
+msigdb_GO_BP <- msigdbr(species = "Homo sapiens",
+                         collection    = "C5",
+                         subcollection = "GO:BP")
+pathways_GO_BP <- split(msigdb_GO_BP$gene_symbol, msigdb_GO_BP$gs_name)
+
+msigdb_H <- msigdbr(species = "Homo sapiens", collection = "H")
+pathways_H <- split(msigdb_H$gene_symbol, msigdb_H$gs_name)
+```
+
+## 5.3 Run GSEA
+
+```{r gsea_run}
+
+# set.seed ensures reproducibility of fgsea permutation-based p-values across runs
+set.seed(42)
+
+# fgsea parameters:
+# minSize = 15: gene sets with fewer than 15 genes in the ranked list are excluded
+# maxSize = 500: gene sets with more than 500 genes are excluded
+# These are standard filters to avoid testing gene sets that are too small
+# (unreliable statistics) or too large (too broad to be interpretable)
+
+# GO Biological Process
+gsea_GO_BP_eMPC_vs_iPSC_backbone <- fgsea(pathways = pathways_GO_BP,
+                                            stats    = rank_eMPC_vs_iPSC_backbone,
+                                            minSize  = 15, maxSize = 500)
+
+gsea_GO_BP_EC_vs_eMPC_backbone   <- fgsea(pathways = pathways_GO_BP,
+                                            stats    = rank_EC_vs_eMPC_backbone,
+                                            minSize  = 15, maxSize = 500)
+
+gsea_GO_BP_EC_vs_iPSC_backbone   <- fgsea(pathways = pathways_GO_BP,
+                                            stats    = rank_EC_vs_iPSC_backbone,
+                                            minSize  = 15, maxSize = 500)
+
+# Hallmark
+gsea_H_eMPC_vs_iPSC_backbone <- fgsea(pathways = pathways_H,
+                                        stats    = rank_eMPC_vs_iPSC_backbone,
+                                        minSize  = 15, maxSize = 500)
+
+gsea_H_EC_vs_eMPC_backbone   <- fgsea(pathways = pathways_H,
+                                        stats    = rank_EC_vs_eMPC_backbone,
+                                        minSize  = 15, maxSize = 500)
+
+gsea_H_EC_vs_iPSC_backbone   <- fgsea(pathways = pathways_H,
+                                        stats    = rank_EC_vs_iPSC_backbone,
+                                        minSize  = 15, maxSize = 500)
+
+# Filter significant results (padj < 0.05)
+# NES > 0: pathway enriched in the later stage of the contrast
+# NES < 0: pathway enriched in the earlier stage of the contrast
+gsea_GO_BP_eMPC_vs_iPSC_sig_backbone <- gsea_GO_BP_eMPC_vs_iPSC_backbone[gsea_GO_BP_eMPC_vs_iPSC_backbone$padj < 0.05, ]
+gsea_GO_BP_EC_vs_eMPC_sig_backbone   <- gsea_GO_BP_EC_vs_eMPC_backbone[gsea_GO_BP_EC_vs_eMPC_backbone$padj < 0.05, ]
+gsea_GO_BP_EC_vs_iPSC_sig_backbone   <- gsea_GO_BP_EC_vs_iPSC_backbone[gsea_GO_BP_EC_vs_iPSC_backbone$padj < 0.05, ]
+
+gsea_H_eMPC_vs_iPSC_sig_backbone <- gsea_H_eMPC_vs_iPSC_backbone[gsea_H_eMPC_vs_iPSC_backbone$padj < 0.05, ]
+gsea_H_EC_vs_eMPC_sig_backbone   <- gsea_H_EC_vs_eMPC_backbone[gsea_H_EC_vs_eMPC_backbone$padj < 0.05, ]
+gsea_H_EC_vs_iPSC_sig_backbone   <- gsea_H_EC_vs_iPSC_backbone[gsea_H_EC_vs_iPSC_backbone$padj < 0.05, ]
+
+# Print summary
+cat("=== GO Biological Process ===\n")
+cat("Significant pathways - eMPC vs iPSC:", nrow(gsea_GO_BP_eMPC_vs_iPSC_sig_backbone), "\n")
+cat("Significant pathways - EC vs eMPC:",   nrow(gsea_GO_BP_EC_vs_eMPC_sig_backbone),   "\n")
+cat("Significant pathways - EC vs iPSC:",   nrow(gsea_GO_BP_EC_vs_iPSC_sig_backbone),   "\n")
+
+cat("\n=== Hallmark ===\n")
+cat("Significant pathways - eMPC vs iPSC:", nrow(gsea_H_eMPC_vs_iPSC_sig_backbone), "\n")
+cat("Significant pathways - EC vs eMPC:",   nrow(gsea_H_EC_vs_eMPC_sig_backbone),   "\n")
+cat("Significant pathways - EC vs iPSC:",   nrow(gsea_H_EC_vs_iPSC_sig_backbone),   "\n")
+```
+
+## 5.4 Export GSEA Results
+
+```{r gsea_export}
+# Convert the leadingEdge column from a list to a character string for Excel compatibility.
+
+prep_export <- function(df) {
+  df$leadingEdge <- sapply(df$leadingEdge, paste, collapse = ", ")
+  return(as.data.frame(df))
+}
+
+# Export GO BP - full results and significant only
+write_xlsx(
+  list("eMPC_vs_iPSC" = prep_export(gsea_GO_BP_eMPC_vs_iPSC_backbone),
+       "EC_vs_eMPC"   = prep_export(gsea_GO_BP_EC_vs_eMPC_backbone),
+       "EC_vs_iPSC"   = prep_export(gsea_GO_BP_EC_vs_iPSC_backbone)),
+  path = "GSEA_GO_BP_backbone.xlsx"
+)
+
+write_xlsx(
+  list("eMPC_vs_iPSC_sig" = prep_export(gsea_GO_BP_eMPC_vs_iPSC_sig_backbone),
+       "EC_vs_eMPC_sig"   = prep_export(gsea_GO_BP_EC_vs_eMPC_sig_backbone),
+       "EC_vs_iPSC_sig"   = prep_export(gsea_GO_BP_EC_vs_iPSC_sig_backbone)),
+  path = "GSEA_GO_BP_backbone_significant.xlsx"
+)
+
+# Export Hallmark — full results and significant only
+write_xlsx(
+  list("eMPC_vs_iPSC" = prep_export(gsea_H_eMPC_vs_iPSC_backbone),
+       "EC_vs_eMPC"   = prep_export(gsea_H_EC_vs_eMPC_backbone),
+       "EC_vs_iPSC"   = prep_export(gsea_H_EC_vs_iPSC_backbone)),
+  path = "GSEA_Hallmark_backbone.xlsx"
+)
+
+write_xlsx(
+  list("eMPC_vs_iPSC_sig" = prep_export(gsea_H_eMPC_vs_iPSC_sig_backbone),
+       "EC_vs_eMPC_sig"   = prep_export(gsea_H_EC_vs_eMPC_sig_backbone),
+       "EC_vs_iPSC_sig"   = prep_export(gsea_H_EC_vs_iPSC_sig_backbone)),
+  path = "GSEA_Hallmark_backbone_significant.xlsx"
+)
+```
+
+## 5.5 GSEA Plots
+
+```{r gsea_top_plots, fig.width=9, fig.height=7}
+# Visualize the top 10 enriched pathways per direction per contrast
+# NES > 0 (red): enriched in the later stage of the contrast
+# NES < 0 (blue): enriched in the earlier stage of the contrast
+# Only pathways with padj < 0.05 are shown
+
+plot_top_gsea <- function(gsea_res, contrast_name, n = 10) {
+  
+  gsea_df <- as.data.frame(gsea_res) %>%
+    filter(!is.na(padj), padj < 0.05)
+  
+  top_pos <- gsea_df %>%
+    filter(NES > 0) %>%
+    arrange(desc(NES)) %>%
+    slice_head(n = n)
+  
+  top_neg <- gsea_df %>%
+    filter(NES < 0) %>%
+    arrange(NES) %>%
+    slice_head(n = n)
+  
+  top_terms <- bind_rows(top_neg, top_pos) %>%
+    mutate(
+      pathway_clean = pathway %>%
+        str_replace_all("^GOBP_", "") %>%
+        str_replace_all("^HALLMARK_", "") %>%
+        str_replace_all("_", " ") %>%
+        str_to_title(),
+      pathway_clean = str_wrap(pathway_clean, width = 45),
+      pathway_clean = factor(pathway_clean, 
+                             levels = pathway_clean[order(NES)])
+    )
+  
+  ggplot(top_terms, aes(x = NES, y = pathway_clean, fill = NES > 0)) +
+    geom_col() +
+    geom_vline(xintercept = 0, linetype = "dashed") +
+    scale_fill_manual(
+      values = c("TRUE" = "#B2182B", "FALSE" = "#2166AC"),
+      labels = c("Earlier stage", "Later stage"),
+      name = NULL
+    ) +
+    labs(
+      title = paste("Top enriched pathways -", contrast_name),
+      x = "Normalized Enrichment Score (NES)",
+      y = NULL
+    ) +
+    theme_bw() +
+    theme(
+      panel.grid.minor = element_blank(),
+      panel.border     = element_blank(),
+      plot.title       = element_text(hjust = 0.5, size = 13),
+      axis.text.y      = element_text(size = 9),
+      legend.position  = "bottom"
+    )
+}
+
+# Hallmark plots
+plot_top_gsea(gsea_H_eMPC_vs_iPSC_backbone, "eMPC vs iPSC - Hallmark", n = 10)
+plot_top_gsea(gsea_H_EC_vs_eMPC_backbone,   "EC vs eMPC - Hallmark",   n = 10)
+plot_top_gsea(gsea_H_EC_vs_iPSC_backbone,   "EC vs iPSC - Hallmark",   n = 10)
+
+# GO BP plots
+plot_top_gsea(gsea_GO_BP_eMPC_vs_iPSC_backbone, "eMPC vs iPSC - GO BP", n = 10)
+plot_top_gsea(gsea_GO_BP_EC_vs_eMPC_backbone,   "EC vs eMPC - GO BP",   n = 10)
+plot_top_gsea(gsea_GO_BP_EC_vs_iPSC_backbone,   "EC vs iPSC - GO BP",   n = 10)
+```
+
+# 6. GSEA - Common Genes (Backbone x GSE271101)
+
+```{r load_gse271101_objects}
+# Load GSE271101 topTable objects produced by Validation_GSE271101.Rmd
+# Note: eMPC (backbone) and EPC (GSE271101) represent the same biological stage
+DEGenes_EPC_vs_iPSC_gse271101 <- readRDS("DEGenes_EPC_vs_iPSC_gse271101.rds")
+DEGenes_EC_vs_EPC_gse271101   <- readRDS("DEGenes_EC_vs_EPC_gse271101.rds")
+DEGenes_EC_vs_iPSC_gse271101  <- readRDS("DEGenes_EC_vs_iPSC_gse271101.rds")
+```
+
+```{r common_genes}
+# Identify genes present in both datasets for each contrast
+# Only genes detected and tested in both datasets are retained
+# This restricts the analysis to a shared gene space, reducing
+# protocol-specific transcriptional noise.
+
+common_genes_eMPC_vs_iPSC <- intersect(
+  DEGenes_iPSC_eMPC_backbone$GeneID,
+  DEGenes_EPC_vs_iPSC_gse271101$GeneID
+)
+
+common_genes_EC_vs_eMPC <- intersect(
+  DEGenes_eMPC_EC_backbone$GeneID,
+  DEGenes_EC_vs_EPC_gse271101$GeneID
+)
+
+common_genes_EC_vs_iPSC <- intersect(
+  DEGenes_iPSC_EC_backbone$GeneID,
+  DEGenes_EC_vs_iPSC_gse271101$GeneID
+)
+
+cat("=== Common genes — backbone x GSE271101 ===\n")
+cat("eMPC/EPC vs iPSC:", length(common_genes_eMPC_vs_iPSC), "\n")
+cat("EC vs eMPC/EPC:",   length(common_genes_EC_vs_eMPC),   "\n")
+cat("EC vs iPSC:",       length(common_genes_EC_vs_iPSC),   "\n")
+```
+```{r save_common_universe}
+# Confirm that the common gene universe is identical across all three contrasts
+
+stopifnot(
+  setequal(common_genes_eMPC_vs_iPSC, common_genes_EC_vs_eMPC),
+  setequal(common_genes_eMPC_vs_iPSC, common_genes_EC_vs_iPSC)
+)
+
+# Create a single common-universe object
+common_universe_genes <- common_genes_eMPC_vs_iPSC
+
+# Check size
+cat("Common gene universe:", length(common_universe_genes), "genes\n")
+
+# Save for use in downstream analyses, including TFTrack.Rmd
+saveRDS(
+  common_universe_genes,
+  "common_universe_genes.rds"
+)
+```
+
+```{r filter_backbone_common}
+# Filter backbone topTable objects to common genes only
+# Working on copies — original objects are not modified
+
+DEGenes_eMPC_vs_iPSC_common <- DEGenes_iPSC_eMPC_backbone[
+  DEGenes_iPSC_eMPC_backbone$GeneID %in% common_genes_eMPC_vs_iPSC, ]
+
+DEGenes_EC_vs_eMPC_common <- DEGenes_eMPC_EC_backbone[
+  DEGenes_eMPC_EC_backbone$GeneID %in% common_genes_EC_vs_eMPC, ]
+
+DEGenes_EC_vs_iPSC_common <- DEGenes_iPSC_EC_backbone[
+  DEGenes_iPSC_EC_backbone$GeneID %in% common_genes_EC_vs_iPSC, ]
+
+cat("=== Backbone rows after filtering to common genes ===\n")
+cat("eMPC vs iPSC:", nrow(DEGenes_eMPC_vs_iPSC_common), "\n")
+cat("EC vs eMPC:",   nrow(DEGenes_EC_vs_eMPC_common),   "\n")
+cat("EC vs iPSC:",   nrow(DEGenes_EC_vs_iPSC_common),   "\n")
+```
+
+```{r gsea_common_ranked}
+# Create ranked gene lists from common genes only
+# Same prepare_rank function as above — t-statistic from backbone eBayes
+rank_eMPC_vs_iPSC_common <- prepare_rank(DEGenes_eMPC_vs_iPSC_common)
+rank_EC_vs_eMPC_common   <- prepare_rank(DEGenes_EC_vs_eMPC_common)
+rank_EC_vs_iPSC_common   <- prepare_rank(DEGenes_EC_vs_iPSC_common)
+
+cat("=== Genes in ranked list (common gene set) ===\n")
+cat("eMPC vs iPSC:", length(rank_eMPC_vs_iPSC_common), "\n")
+cat("EC vs eMPC:",   length(rank_EC_vs_eMPC_common),   "\n")
+cat("EC vs iPSC:",   length(rank_EC_vs_iPSC_common),   "\n")
+```
+
+```{r gsea_common_run}
+# set.seed ensures reproducibility of fgsea permutation-based p-values across runs
+set.seed(42)
+
+# GO Biological Process — common genes
+gsea_GO_BP_eMPC_vs_iPSC_common <- fgsea(pathways = pathways_GO_BP,
+                                          stats    = rank_eMPC_vs_iPSC_common,
+                                          minSize  = 15, maxSize = 500)
+
+gsea_GO_BP_EC_vs_eMPC_common   <- fgsea(pathways = pathways_GO_BP,
+                                          stats    = rank_EC_vs_eMPC_common,
+                                          minSize  = 15, maxSize = 500)
+
+gsea_GO_BP_EC_vs_iPSC_common   <- fgsea(pathways = pathways_GO_BP,
+                                          stats    = rank_EC_vs_iPSC_common,
+                                          minSize  = 15, maxSize = 500)
+
+# Hallmark — common genes
+gsea_H_eMPC_vs_iPSC_common <- fgsea(pathways = pathways_H,
+                                      stats    = rank_eMPC_vs_iPSC_common,
+                                      minSize  = 15, maxSize = 500)
+
+gsea_H_EC_vs_eMPC_common   <- fgsea(pathways = pathways_H,
+                                      stats    = rank_EC_vs_eMPC_common,
+                                      minSize  = 15, maxSize = 500)
+
+gsea_H_EC_vs_iPSC_common   <- fgsea(pathways = pathways_H,
+                                      stats    = rank_EC_vs_iPSC_common,
+                                      minSize  = 15, maxSize = 500)
+
+# Filter significant results
+gsea_GO_BP_eMPC_vs_iPSC_common_sig <- gsea_GO_BP_eMPC_vs_iPSC_common[gsea_GO_BP_eMPC_vs_iPSC_common$padj < 0.05, ]
+gsea_GO_BP_EC_vs_eMPC_common_sig   <- gsea_GO_BP_EC_vs_eMPC_common[gsea_GO_BP_EC_vs_eMPC_common$padj < 0.05, ]
+gsea_GO_BP_EC_vs_iPSC_common_sig   <- gsea_GO_BP_EC_vs_iPSC_common[gsea_GO_BP_EC_vs_iPSC_common$padj < 0.05, ]
+
+gsea_H_eMPC_vs_iPSC_common_sig <- gsea_H_eMPC_vs_iPSC_common[gsea_H_eMPC_vs_iPSC_common$padj < 0.05, ]
+gsea_H_EC_vs_eMPC_common_sig   <- gsea_H_EC_vs_eMPC_common[gsea_H_EC_vs_eMPC_common$padj < 0.05, ]
+gsea_H_EC_vs_iPSC_common_sig   <- gsea_H_EC_vs_iPSC_common[gsea_H_EC_vs_iPSC_common$padj < 0.05, ]
+
+# Print summary
+cat("=== GSEA — Common gene set ===\n")
+cat("\nGO Biological Process:\n")
+cat("Significant pathways - eMPC vs iPSC:", nrow(gsea_GO_BP_eMPC_vs_iPSC_common_sig), "\n")
+cat("Significant pathways - EC vs eMPC:",   nrow(gsea_GO_BP_EC_vs_eMPC_common_sig),   "\n")
+cat("Significant pathways - EC vs iPSC:",   nrow(gsea_GO_BP_EC_vs_iPSC_common_sig),   "\n")
+
+cat("\nHallmark:\n")
+cat("Significant pathways - eMPC vs iPSC:", nrow(gsea_H_eMPC_vs_iPSC_common_sig), "\n")
+cat("Significant pathways - EC vs eMPC:",   nrow(gsea_H_EC_vs_eMPC_common_sig),   "\n")
+cat("Significant pathways - EC vs iPSC:",   nrow(gsea_H_EC_vs_iPSC_common_sig),   "\n")
+```
+## 6.1. Pathway Redundancy Reduction using collapsePathways
+
+```{r collapse_pathways}
+
+# The GO Biological Process collection contains many semantically similar or 
+# hierarchically related terms that may be enriched for the same underlying biological 
+# signal. collapsePathways() from the fgsea package identifies a set of independent 
+# (non-redundant) representative pathways by testing whether each pathway remains 
+# enriched after removing the genes of a more significant pathway. Only pathways 
+# that cannot be explained by a more significant pathway are retained as "main".
+
+library(data.table)
+
+# eMPC vs iPSC
+collapsed_eMPC_vs_iPSC <- collapsePathways(
+  as.data.table(gsea_GO_BP_eMPC_vs_iPSC_common)[order(pval)][padj < 0.05],
+  pathways_GO_BP,
+  rank_eMPC_vs_iPSC_common
+)
+
+# EC vs eMPC
+collapsed_EC_vs_eMPC <- collapsePathways(
+  as.data.table(gsea_GO_BP_EC_vs_eMPC_common)[order(pval)][padj < 0.05],
+  pathways_GO_BP,
+  rank_EC_vs_eMPC_common
+)
+
+# EC vs iPSC
+collapsed_EC_vs_iPSC <- collapsePathways(
+  as.data.table(gsea_GO_BP_EC_vs_iPSC_common)[order(pval)][padj < 0.05],
+  pathways_GO_BP,
+  rank_EC_vs_iPSC_common
+)
+
+# Summary
+cat("=== Main pathways after collapsePathways ===\n")
+cat("eMPC vs iPSC:", length(collapsed_eMPC_vs_iPSC$mainPathways), "\n")
+cat("EC vs eMPC:",   length(collapsed_EC_vs_eMPC$mainPathways),   "\n")
+cat("EC vs iPSC:",   length(collapsed_EC_vs_iPSC$mainPathways),   "\n")
+```
+
+## 6.2. Export GSEA Results with Collapsed Pathway Status
+
+
+```{r gsea_common_export}
+# Function to add clean pathway name column
+# Removes GOBP_ prefix and replaces underscores with spaces
+clean_pathway_name <- function(df) {
+  df$pathway_clean <- df$pathway %>%
+    str_replace_all("^GOBP_", "") %>%
+    str_replace_all("_", " ") %>%
+    str_to_title()
+  df <- df %>% dplyr::select(pathway, pathway_clean, everything())
+  return(df)
+}
+
+# Export GSEA results for the common gene set
+
+# GO BP — all results (with clean pathway name)
+write_xlsx(
+  list(
+    "eMPC_vs_iPSC" = clean_pathway_name(prep_export(gsea_GO_BP_eMPC_vs_iPSC_common)),
+    "EC_vs_eMPC"   = clean_pathway_name(prep_export(gsea_GO_BP_EC_vs_eMPC_common)),
+    "EC_vs_iPSC"   = clean_pathway_name(prep_export(gsea_GO_BP_EC_vs_iPSC_common))
+  ),
+  path = "GSEA_GO_BP_common.xlsx"
+)
+
+# GO BP — significant only
+write_xlsx(
+  list(
+    "eMPC_vs_iPSC_sig" = prep_export(gsea_GO_BP_eMPC_vs_iPSC_common_sig),
+    "EC_vs_eMPC_sig"   = prep_export(gsea_GO_BP_EC_vs_eMPC_common_sig),
+    "EC_vs_iPSC_sig"   = prep_export(gsea_GO_BP_EC_vs_iPSC_common_sig)
+  ),
+  path = "GSEA_GO_BP_common_significant.xlsx"
+)
+
+# Hallmark — all results
+write_xlsx(
+  list(
+    "eMPC_vs_iPSC" = prep_export(gsea_H_eMPC_vs_iPSC_common),
+    "EC_vs_eMPC"   = prep_export(gsea_H_EC_vs_eMPC_common),
+    "EC_vs_iPSC"   = prep_export(gsea_H_EC_vs_iPSC_common)
+  ),
+  path = "GSEA_Hallmark_common.xlsx"
+)
+
+# Hallmark — significant only
+write_xlsx(
+  list(
+    "eMPC_vs_iPSC_sig" = prep_export(gsea_H_eMPC_vs_iPSC_common_sig),
+    "EC_vs_eMPC_sig"   = prep_export(gsea_H_EC_vs_eMPC_common_sig),
+    "EC_vs_iPSC_sig"   = prep_export(gsea_H_EC_vs_iPSC_common_sig)
+  ),
+  path = "GSEA_Hallmark_common_significant.xlsx"
+)
+```
+
+```{r export_collapsed}
+
+#The full GSEA results (padj < 0.05) are exported with an additional column 
+# "collapsed_status" indicating whether each pathway was identified as a representative 
+# ("main") or redundant ("redundant") pathway by collapsePathways(). This file is 
+# intended to guide manual curation — pathways marked as "redundant" can be deprioritized,
+# while "main" pathways are the primary candidates for downstream analysis.
+
+# Function to add collapsed status to GSEA results
+add_collapsed_status <- function(gsea_res, collapsed_obj) {
+  df <- prep_export(gsea_res)
+  df <- clean_pathway_name(df)
+  df$collapsed_status <- ifelse(
+    df$pathway %in% collapsed_obj$mainPathways, "main", "redundant"
+  )
+  return(df)
+}
+
+# Apply to each contrast
+gsea_eMPC_vs_iPSC_collapsed <- add_collapsed_status(
+  gsea_GO_BP_eMPC_vs_iPSC_common, collapsed_eMPC_vs_iPSC)
+gsea_EC_vs_eMPC_collapsed   <- add_collapsed_status(
+  gsea_GO_BP_EC_vs_eMPC_common, collapsed_EC_vs_eMPC)
+gsea_EC_vs_iPSC_collapsed   <- add_collapsed_status(
+  gsea_GO_BP_EC_vs_iPSC_common, collapsed_EC_vs_iPSC)
+
+# Export significant results only, with collapsed status
+write_xlsx(
+  list(
+    "eMPC_vs_iPSC" = gsea_eMPC_vs_iPSC_collapsed[
+      gsea_eMPC_vs_iPSC_collapsed$padj < 0.05, ],
+    "EC_vs_eMPC"   = gsea_EC_vs_eMPC_collapsed[
+      gsea_EC_vs_eMPC_collapsed$padj < 0.05, ],
+    "EC_vs_iPSC"   = gsea_EC_vs_iPSC_collapsed[
+      gsea_EC_vs_iPSC_collapsed$padj < 0.05, ]
+  ),
+  path = "GSEA_GO_BP_common_collapsed.xlsx"
+)
+
+cat("Exported GSEA_GO_BP_common_collapsed.xlsx\n")
+```
+
+
+
+```{r gsea_common_plots, fig.width=9, fig.height=7}
+# Visualise top enriched pathways for the common gene set
+# Same plot function as section 5.5
+
+# Hallmark
+plot_top_gsea(gsea_H_eMPC_vs_iPSC_common, "eMPC vs iPSC - Hallmark (common genes)", n = 10)
+plot_top_gsea(gsea_H_EC_vs_eMPC_common,   "EC vs eMPC - Hallmark (common genes)",   n = 10)
+plot_top_gsea(gsea_H_EC_vs_iPSC_common,   "EC vs iPSC - Hallmark (common genes)",   n = 10)
+
+# GO BP
+plot_top_gsea(gsea_GO_BP_eMPC_vs_iPSC_common, "eMPC vs iPSC - GO BP (common genes)", n = 10)
+plot_top_gsea(gsea_GO_BP_EC_vs_eMPC_common,   "EC vs eMPC - GO BP (common genes)",   n = 10)
+plot_top_gsea(gsea_GO_BP_EC_vs_iPSC_common,   "EC vs iPSC - GO BP (common genes)",   n = 10)
+```
+
+
+
+## 6.3 A Priori Curated GO BP Pathways (Matrix Figure)
+
+```{r apriori_go_matrix, fig.width=7, fig.height=9, message=FALSE, warning=FALSE}
+# Matrix figure of the GO BP pathways retained through the a priori curation.
+# Rows = the 38 retained pathways (grouped by biological category).
+# Columns = contrasts. A point is shown in every contrast where the pathway
+# has padj < 0.05, including contrasts where it was marked no_redundant.
+# An empty cell therefore means padj >= 0.05 in that contrast.
+# Color = NES (positive = enriched toward the later stage); size = -log10(padj).
+# Category order is fixed and identical to Section 4.6.
+# dplyr::select is called explicitly (masked by Bioconductor packages).
+
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(stringr)
+
+file_go <- "~/Desktop/Tese/R/GSEA_GO_BP_curated_apriori.xlsx"
+
+# Read one full sheet, locating the header row automatically
+# (the eMPC_vs_iPSC sheet has extra rows above the header)
+read_sheet <- function(sheet, label) {
+  raw <- read_excel(file_go, sheet = sheet, col_names = FALSE)
+  hdr <- which(apply(raw, 1, function(r) any(r %in% "include_apriori")))[1]
+  df  <- raw[-(1:hdr), ]
+  names(df) <- as.character(unlist(raw[hdr, ]))
+  names(df)[4] <- "category"
+  df %>%
+    transmute(pathway         = pathway_clean,
+              category        = category,
+              NES             = as.numeric(NES),
+              padj            = as.numeric(padj),
+              include_apriori = include_apriori,
+              contrast        = label)
+}
+
+all_go <- bind_rows(
+  read_sheet("eMPC_vs_iPSC", "eMPC vs iPSC"),
+  read_sheet("EC_vs_eMPC",   "EC vs eMPC"),
+  read_sheet("EC_vs_iPSC",   "EC vs iPSC")
+)
+
+# Check 1: retained pathways per contrast (expected 7, 18 and 13)
+all_go %>% filter(include_apriori == "yes_apriori") %>% count(contrast)
+
+# Category of each retained pathway (taken from the rows marked yes_apriori)
+cat_map <- all_go %>%
+  filter(include_apriori == "yes_apriori") %>%
+  distinct(pathway, category)
+
+# Check 2: each pathway should belong to a single category (expect 0 rows)
+cat_map %>% count(pathway) %>% filter(n > 1)
+
+# Check 3: number of retained pathways (expected 38)
+nrow(cat_map)
+
+# Fixed category order (same as Section 4.6):
+# eMPC-associated developmental programs -> stem cell population maintenance
+# -> EC-associated specification and functional programs
+cat_order <- c(
+  "Mesoderm development",
+  "Embryonic patterning and morphogenesis",
+  "Mesenchymal development",
+  "Epithelial\u2013mesenchymal transition",
+  "Cardiovascular and endocardial development",
+  "Developmental signaling",
+  "Stem cell population maintenance",
+  "Endothelial specification",
+  "VEGF signaling and endothelial response",
+  "Angiogenesis / vasculogenesis",
+  "Cell adhesion and cell\u2013matrix interaction",
+  "Extracellular matrix organization / remodeling",
+  "Mechanotransduction / shear stress",
+  "Vascular homeostasis / fluid regulation",
+  "Hemostasis / coagulation",
+  "Immune / inflammatory response"
+)
+
+# Category display names
+clean_category <- function(x) {
+  x %>%
+    str_to_sentence() %>%
+    str_replace_all("signalling", "signaling") %>%
+    str_replace_all("remodelling", "remodeling") %>%
+    str_replace("^Vegf", "VEGF") %>%
+    str_replace("^Pluripotency / stem cell maintenance$",
+                "Stem cell population maintenance") %>%
+    str_replace("Epithelial-mesenchymal", "Epithelial\u2013mesenchymal") %>%
+    str_replace("cell-matrix", "cell\u2013matrix")
+}
+
+# Pathway display names: official GO punctuation, lowercase prepositions, WNT
+clean_pathway <- function(x) {
+  x <- gsub("\\b(Of|To|In|And|By|Via|The)\\b", "\\L\\1", x, perl = TRUE)
+  x %>%
+    str_replace("Non Canonical Wnt", "Non-Canonical WNT") %>%
+    str_replace_all("\\bWnt\\b", "WNT") %>%
+    str_replace("Anterior Posterior", "Anterior/Posterior") %>%
+    str_replace("Cell Substrate", "Cell\u2013Substrate")
+}
+
+# All significant results of the retained pathways, in every contrast
+go_apriori_matrix <- all_go %>%
+  filter(pathway %in% cat_map$pathway, padj < 0.05) %>%
+  dplyr::select(-category) %>%
+  left_join(cat_map, by = "pathway") %>%
+  mutate(
+    contrast = factor(contrast, levels = c("eMPC vs iPSC", "EC vs eMPC", "EC vs iPSC")),
+    category = factor(clean_category(category), levels = cat_order),
+    pathway  = str_wrap(clean_pathway(pathway), 45)
+  )
+
+# Check 4: points per contrast and status (expected totals 8, 20 and 19)
+go_apriori_matrix %>% count(contrast, include_apriori)
+
+# Check 5: all categories matched cat_order (expect 0 rows)
+go_apriori_matrix %>% filter(is.na(category))
+
+# Check 6: NES of the points added in this version (to review direction)
+go_apriori_matrix %>%
+  filter(include_apriori != "yes_apriori") %>%
+  dplyr::select(pathway, contrast, NES, padj) %>%
+  arrange(contrast)
+
+# Check 7: final display names (expect 38)
+sort(unique(go_apriori_matrix$pathway))
+
+p_go_matrix <- ggplot(go_apriori_matrix, aes(x = contrast, y = pathway)) +
+  geom_point(aes(color = NES, size = -log10(padj))) +
+  scale_color_gradient2(low = "#2166AC", mid = "white", high = "#B2182B",
+                        midpoint = 0, name = "NES") +
+    scale_size_continuous(range = c(2, 6),
+                        name = expression(-log[10](italic(p)[adj]))) +
+  scale_x_discrete(labels = function(x) str_replace(x, " vs ", "\nvs ")) +
+  scale_y_discrete(limits = rev) +
+  facet_grid(category ~ ., scales = "free_y", space = "free_y", switch = "y",
+             labeller = labeller(category = label_wrap_gen(28))) +
+  labs(x = NULL, y = NULL) +
+  theme_bw(base_size = 9) +
+  theme(
+    strip.placement   = "outside",
+    strip.text.y.left = element_text(angle = 0, face = "bold", size = 7.5),
+    strip.background  = element_rect(fill = "grey95", color = NA),
+    panel.grid.minor  = element_blank(),
+    axis.text.x       = element_text(face = "bold"),
+    panel.spacing     = unit(0.25, "lines")
+  )
+
+p_go_matrix
+
+ggsave("apriori_go_bp_matrix.pdf", p_go_matrix, width = 7, height = 9)
+```
+
+# 7. Replicated DEGs — Backbone x GSE271101 (Additional Section)
+
+```{r deg_intersection}
+# Load filtered DEGs from GSE271101
+DEGs_EPC_vs_iPSC_gse271101 <- readRDS("DEGs_EPC_vs_iPSC_gse271101.rds")
+DEGs_EC_vs_EPC_gse271101   <- readRDS("DEGs_EC_vs_EPC_gse271101.rds")
+DEGs_EC_vs_iPSC_gse271101  <- readRDS("DEGs_EC_vs_iPSC_gse271101.rds")
+
+# Intersect filtered DEGs between backbone and GSE271101 per equivalent contrast
+# eMPC (backbone) = EPC (GSE271101) — same biological stage, different nomenclature
+
+common_DEGs_eMPC_vs_iPSC <- intersect(
+  DEGs_eMPC_vs_iPSC_backbone$GeneID,
+  DEGs_EPC_vs_iPSC_gse271101$GeneID
+)
+
+common_DEGs_EC_vs_eMPC <- intersect(
+  DEGs_EC_vs_eMPC_backbone$GeneID,
+  DEGs_EC_vs_EPC_gse271101$GeneID
+)
+
+common_DEGs_EC_vs_iPSC <- intersect(
+  DEGs_EC_vs_iPSC_backbone$GeneID,
+  DEGs_EC_vs_iPSC_gse271101$GeneID
+)
+
+cat("=== Replicated DEGs — backbone x GSE271101 ===\n")
+cat("eMPC/EPC vs iPSC:", length(common_DEGs_eMPC_vs_iPSC), "\n")
+cat("EC vs eMPC/EPC:",   length(common_DEGs_EC_vs_eMPC),   "\n")
+cat("EC vs iPSC:",       length(common_DEGs_EC_vs_iPSC),   "\n")
+```
+
+```{r export_common_degs}
+# Subset backbone topTable to replicated DEGs per contrast
+rep_DEGs_eMPC_vs_iPSC <- DEGs_eMPC_vs_iPSC_backbone[
+  DEGs_eMPC_vs_iPSC_backbone$GeneID %in% common_DEGs_eMPC_vs_iPSC, ]
+
+rep_DEGs_EC_vs_eMPC <- DEGs_EC_vs_eMPC_backbone[
+  DEGs_EC_vs_eMPC_backbone$GeneID %in% common_DEGs_EC_vs_eMPC, ]
+
+rep_DEGs_EC_vs_iPSC <- DEGs_EC_vs_iPSC_backbone[
+  DEGs_EC_vs_iPSC_backbone$GeneID %in% common_DEGs_EC_vs_iPSC, ]
+
+# Export replicated DEGs to Excel — ranked by logFC descending
+write_xlsx(
+  list(
+    "eMPC_vs_iPSC" = rep_DEGs_eMPC_vs_iPSC[
+      order(rep_DEGs_eMPC_vs_iPSC$logFC, decreasing = TRUE), ],
+    "EC_vs_eMPC"   = rep_DEGs_EC_vs_eMPC[
+      order(rep_DEGs_EC_vs_eMPC$logFC, decreasing = TRUE), ],
+    "EC_vs_iPSC"   = rep_DEGs_EC_vs_iPSC[
+      order(rep_DEGs_EC_vs_iPSC$logFC, decreasing = TRUE), ]
+  ),
+  path = "DEGs_replicated_backbone_GSE271101.xlsx"
+)
+```
+
+
+# 8. Leading Edge Gene Extraction and Molecular Signature Construction
+
+
+```{r load_curation_file}
+
+# For each contrast, pathways marked as "yes_final" in the manual curation file are 
+# selected. The leading edge genes from each selected pathway are extracted and 
+# aggregated by stage association (contrast_side). Genes appearing in multiple pathways
+# within the same stage are counted to identify the most recurrent genes, which are 
+# prioritised for the molecular signature.
+
+library(readxl)
+library(tidyr)
+
+# Load the manually curated GO term file
+# Sheet names correspond to the three contrasts
+curation_eMPC_vs_iPSC <- read_excel(
+  "~/Desktop/Tese/R/GSEA_GO_BP_curated_apriori.xlsx", sheet = "eMPC_vs_iPSC", skip = 2)
+curation_EC_vs_eMPC   <- read_excel(
+  "~/Desktop/Tese/R/GSEA_GO_BP_curated_apriori.xlsx", sheet = "EC_vs_eMPC", skip = 0)
+curation_EC_vs_iPSC   <- read_excel(
+  "~/Desktop/Tese/R/GSEA_GO_BP_curated_apriori.xlsx", sheet = "EC_vs_iPSC", skip = 0)
+
+# Confirm column names
+cat("Columns:", paste(colnames(curation_eMPC_vs_iPSC), collapse = ", "), "\n")
+```
+
+```{r extract_leading_edge}
+# Function to extract leading edge genes from yes_apriori pathways
+# Returns a data frame with pathway, contrast_side, biological_category,
+# and individual genes (one per row)
+# dplyr/tidyr functions are called explicitly, because rename(), mutate()
+# and filter() are masked by Bioconductor packages (S4Vectors, clusterProfiler).
+
+extract_leading_edge <- function(curation_df, contrast_name) {
+
+  # Identify column names by position
+  # Column order in GSEA_GO_BP_curated_apriori.xlsx:
+  # 1 = Include in signature? (old, data-driven — not used here)
+  # 2 = include_apriori (new, a priori selection — used here)
+  # 3 = Stage-associated side of contrast
+  # 4 = Biological category
+  include_col  <- colnames(curation_df)[2]
+  side_col     <- colnames(curation_df)[3]
+  category_col <- colnames(curation_df)[4]
+
+  # Sanity check — stop early and loudly if the columns aren't what we expect,
+  # instead of silently extracting from the wrong columns
+  stopifnot(include_col == "include_apriori")
+
+  # Filter yes_apriori pathways
+  selected <- curation_df[
+    !is.na(curation_df[[include_col]]) &
+    curation_df[[include_col]] == "yes_apriori", ]
+
+  cat(contrast_name, "— yes_apriori pathways:", nrow(selected), "\n")
+
+  # Extract and explode leading edge genes
+  result <- selected %>%
+    dplyr::select(
+      pathway             = pathway,
+      pathway_clean       = pathway_clean,
+      contrast_side       = dplyr::all_of(side_col),
+      biological_category = dplyr::all_of(category_col),
+      NES,
+      leadingEdge
+    ) %>%
+    dplyr::mutate(
+      contrast    = contrast_name,
+      leadingEdge = as.character(leadingEdge)
+    ) %>%
+    tidyr::separate_rows(leadingEdge, sep = ",\\s*") %>%
+    dplyr::rename(gene = leadingEdge) %>%
+    dplyr::filter(!is.na(gene), gene != "")
+
+  return(result)
+}
+
+# Apply to each contrast
+le_eMPC_vs_iPSC <- extract_leading_edge(curation_eMPC_vs_iPSC, "eMPC_vs_iPSC")
+le_EC_vs_eMPC   <- extract_leading_edge(curation_EC_vs_eMPC,   "EC_vs_eMPC")
+le_EC_vs_iPSC   <- extract_leading_edge(curation_EC_vs_iPSC,   "EC_vs_iPSC")
+
+# Combine all contrasts
+le_all <- dplyr::bind_rows(le_eMPC_vs_iPSC, le_EC_vs_eMPC, le_EC_vs_iPSC)
+
+cat("\nTotal gene-pathway associations extracted:", nrow(le_all), "\n")
+```
+
+```{r assign_stage}
+# Assign provisional stage based on contrast and NES sign (contrast_side)
+# This is a provisional assignment — final stage attribution requires
+# cross-contrast consistency check and biological validation
+
+le_all <- le_all %>%
+  mutate(provisional_stage = case_when(
+    contrast == "eMPC_vs_iPSC" & contrast_side == "eMPC-side" ~ "eMPC",
+    contrast == "eMPC_vs_iPSC" & contrast_side == "iPSC-side" ~ "iPSC",
+    contrast == "EC_vs_eMPC"   & contrast_side == "EC-side"   ~ "EC",
+    contrast == "EC_vs_eMPC"   & contrast_side == "eMPC-side" ~ "eMPC",
+    contrast == "EC_vs_iPSC"   & contrast_side == "EC-side"   ~ "EC",
+    contrast == "EC_vs_iPSC"   & contrast_side == "iPSC-side" ~ "iPSC",
+    TRUE ~ NA_character_
+  ))
+
+# Count gene recurrence per provisional stage
+# Genes appearing in multiple pathways within the same stage
+# are more robust candidates for the molecular signature
+
+gene_recurrence <- le_all %>%
+  group_by(provisional_stage, gene) %>%
+  summarise(
+    n_pathways    = n_distinct(pathway),
+    pathways      = paste(unique(pathway_clean), collapse = "; "),
+    categories    = paste(unique(biological_category), collapse = "; "),
+    .groups = "drop"
+  ) %>%
+  arrange(provisional_stage, desc(n_pathways))
+
+cat("\n=== Gene recurrence summary ===\n")
+cat("iPSC genes:",  nrow(gene_recurrence[gene_recurrence$provisional_stage == "iPSC",  ]), "\n")
+cat("eMPC genes:",  nrow(gene_recurrence[gene_recurrence$provisional_stage == "eMPC",  ]), "\n")
+cat("EC genes:",    nrow(gene_recurrence[gene_recurrence$provisional_stage == "EC",    ]), "\n")
+
+table(le_all$contrast, le_all$provisional_stage)
+
+# NOTE: provisional_stage is a rough, per-row label derived only from
+# pathway side (NES sign) and does not resolve genes appearing in
+# opposite-side pathways across different contrasts (e.g. a gene that is
+# eMPC-side in eMPC_vs_iPSC but EC-side in EC_vs_eMPC). This is expected
+# and resolved downstream by classifying trajectory_sign_class from
+# per-gene logFC (L1, L2) across the three contrasts — see next section.
+```
+
+```{r export_leading_edge}
+library(writexl)
+
+# Export full leading edge table
+write_xlsx(
+  list(
+    "eMPC_vs_iPSC" = as.data.frame(le_eMPC_vs_iPSC),
+    "EC_vs_eMPC"   = as.data.frame(le_EC_vs_eMPC),
+    "EC_vs_iPSC"   = as.data.frame(le_EC_vs_iPSC)
+  ),
+  path = "leading_edge_genes_by_contrast.xlsx"
+)
+
+# Export gene recurrence per stage
+write_xlsx(
+  list(
+    "iPSC" = as.data.frame(gene_recurrence[gene_recurrence$provisional_stage == "iPSC", ]),
+    "eMPC" = as.data.frame(gene_recurrence[gene_recurrence$provisional_stage == "eMPC", ]),
+    "EC"   = as.data.frame(gene_recurrence[gene_recurrence$provisional_stage == "EC",   ])
+  ),
+  path = "molecular_signatures_provisional.xlsx"
+)
+
+cat("Exported leading_edge_genes_by_contrast.xlsx\n")
+cat("Exported molecular_signatures_provisional.xlsx\n")
+```
+
+```{r export_full_toptable}
+# Export the complete topTable (all genes, not just DEGs) for the three
+# contrasts, with logFC, t-statistic, and p-values. This is the input for
+# the L1/L2/L3 trajectory classification of genes already identified in
+# the yes_apriori leading-edge gene set (le_all).
+
+write_xlsx(
+  list(
+    "eMPC_vs_iPSC" = DEGenes_iPSC_eMPC_backbone[, c("GeneID", "logFC", "t", "P.Value", "adj.P.Val")],
+    "EC_vs_eMPC"   = DEGenes_eMPC_EC_backbone[,   c("GeneID", "logFC", "t", "P.Value", "adj.P.Val")],
+    "EC_vs_iPSC"   = DEGenes_iPSC_EC_backbone[,   c("GeneID", "logFC", "t", "P.Value", "adj.P.Val")]
+  ),
+  path = "DEGs_full_toptable_three_contrasts.xlsx"
+)
+
+cat("Exported DEGs_full_toptable_three_contrasts.xlsx\n")
+cat("Genes in eMPC_vs_iPSC:", nrow(DEGenes_iPSC_eMPC_backbone), "\n")
+cat("Genes in EC_vs_eMPC:",   nrow(DEGenes_eMPC_EC_backbone),   "\n")
+cat("Genes in EC_vs_iPSC:",   nrow(DEGenes_iPSC_EC_backbone),   "\n")
+```
+
+# 9. Over-Representation Analysis (ORA) — Replicated DEGs
+
+ORA tests whether genes from a predefined list are over-represented in GO Biological Process gene sets relative to a background universe. Input: DEGs replicated between backbone and GSE271101, filtered for directional concordance (same sign of logFC in both datasets). ORA is run separately for upregulated and downregulated genes per contrast, and results are compared with GSEA yes_final pathways by direction and GO ID.
+
+```{r ora_directional_degs}
+# Step 1: Add GSE271101 logFC to replicated DEG objects and filter
+# for directional concordance (sign(logFC_backbone) == sign(logFC_gse271101))
+
+add_gse_logfc_and_filter <- function(rep_degs, gse_degs, contrast_name) {
+  
+  # Bring logFC from GSE271101
+  gse_logfc <- gse_degs[, c("GeneID", "logFC")]
+  colnames(gse_logfc)[2] <- "logFC_gse271101"
+  
+  # Merge with backbone DEGs
+  merged <- merge(rep_degs, gse_logfc, by = "GeneID", all.x = TRUE)
+  colnames(merged)[colnames(merged) == "logFC"] <- "logFC_backbone"
+  
+  # Check directional concordance
+  merged$concordant <- sign(merged$logFC_backbone) == sign(merged$logFC_gse271101)
+  
+  # Summary
+  cat(contrast_name, "\n")
+  cat("  Total replicated DEGs:", nrow(merged), "\n")
+  cat("  Concordant:", sum(merged$concordant, na.rm = TRUE), "\n")
+  cat("  Discordant:", sum(!merged$concordant, na.rm = TRUE), "\n\n")
+  
+  return(merged)
+}
+
+# Apply to each contrast
+# Note: eMPC (backbone) = EPC (GSE271101) — same biological stage
+rep_eMPC_vs_iPSC_dir <- add_gse_logfc_and_filter(
+  rep_DEGs_eMPC_vs_iPSC, DEGs_EPC_vs_iPSC_gse271101, "eMPC_vs_iPSC")
+
+rep_EC_vs_eMPC_dir <- add_gse_logfc_and_filter(
+  rep_DEGs_EC_vs_eMPC, DEGs_EC_vs_EPC_gse271101, "EC_vs_eMPC")
+
+rep_EC_vs_iPSC_dir <- add_gse_logfc_and_filter(
+  rep_DEGs_EC_vs_iPSC, DEGs_EC_vs_iPSC_gse271101, "EC_vs_iPSC")
+
+# Step 2: Split concordant DEGs by direction
+# up_concordant: logFC > 0 in both datasets
+# down_concordant: logFC < 0 in both datasets
+
+up_eMPC_vs_iPSC   <- rep_eMPC_vs_iPSC_dir$GeneID[
+  rep_eMPC_vs_iPSC_dir$concordant & rep_eMPC_vs_iPSC_dir$logFC_backbone > 0]
+down_eMPC_vs_iPSC <- rep_eMPC_vs_iPSC_dir$GeneID[
+  rep_eMPC_vs_iPSC_dir$concordant & rep_eMPC_vs_iPSC_dir$logFC_backbone < 0]
+
+up_EC_vs_eMPC   <- rep_EC_vs_eMPC_dir$GeneID[
+  rep_EC_vs_eMPC_dir$concordant & rep_EC_vs_eMPC_dir$logFC_backbone > 0]
+down_EC_vs_eMPC <- rep_EC_vs_eMPC_dir$GeneID[
+  rep_EC_vs_eMPC_dir$concordant & rep_EC_vs_eMPC_dir$logFC_backbone < 0]
+
+up_EC_vs_iPSC   <- rep_EC_vs_iPSC_dir$GeneID[
+  rep_EC_vs_iPSC_dir$concordant & rep_EC_vs_iPSC_dir$logFC_backbone > 0]
+down_EC_vs_iPSC <- rep_EC_vs_iPSC_dir$GeneID[
+  rep_EC_vs_iPSC_dir$concordant & rep_EC_vs_iPSC_dir$logFC_backbone < 0]
+
+cat("=== Concordant DEGs by direction ===\n")
+cat("eMPC vs iPSC — up:", length(up_eMPC_vs_iPSC),
+    "/ down:", length(down_eMPC_vs_iPSC), "\n")
+cat("EC vs eMPC   — up:", length(up_EC_vs_eMPC),
+    "/ down:", length(down_EC_vs_eMPC), "\n")
+cat("EC vs iPSC   — up:", length(up_EC_vs_iPSC),
+    "/ down:", length(down_EC_vs_iPSC), "\n")
+
+# Export concordance table for transparency
+write_xlsx(
+  list(
+    "eMPC_vs_iPSC" = rep_eMPC_vs_iPSC_dir[, c("GeneID", "logFC_backbone",
+                                                 "logFC_gse271101", "concordant")],
+    "EC_vs_eMPC"   = rep_EC_vs_eMPC_dir[,   c("GeneID", "logFC_backbone",
+                                                 "logFC_gse271101", "concordant")],
+    "EC_vs_iPSC"   = rep_EC_vs_iPSC_dir[,   c("GeneID", "logFC_backbone",
+                                                 "logFC_gse271101", "concordant")]
+  ),
+  path = "DEGs_replicated_concordance.xlsx"
+)
+```
+
+```{r ora_run, message=FALSE}
+# Step 3: Run ORA per direction per contrast
+# Background: 11113 common genes tested in both datasets
+# Collection: GO Biological Process via org.Hs.eg.db
+
+library(clusterProfiler)
+library(org.Hs.eg.db)
+
+# Use common genes as background
+background_genes <- names(rank_eMPC_vs_iPSC_common)
+cat("Background gene universe:", length(background_genes), "\n\n")
+
+run_ora <- function(gene_list, background, label) {
+  if (length(gene_list) < 5) {
+    cat(label, ": too few genes (", length(gene_list), ") — skipping\n")
+    return(NULL)
+  }
+  res <- enrichGO(
+    gene          = gene_list,
+    universe      = background,
+    OrgDb         = org.Hs.eg.db,
+    keyType       = "SYMBOL",
+    ont           = "BP",
+    pAdjustMethod = "BH",
+    pvalueCutoff  = 0.05,
+    qvalueCutoff  = 0.05,
+    readable      = TRUE
+  )
+  cat(label, ":", nrow(as.data.frame(res)), "significant terms\n")
+  return(res)
+}
+
+cat("=== ORA significant terms ===\n")
+ora_up_eMPC_vs_iPSC   <- run_ora(up_eMPC_vs_iPSC,   background_genes, "eMPC vs iPSC — up")
+ora_down_eMPC_vs_iPSC <- run_ora(down_eMPC_vs_iPSC, background_genes, "eMPC vs iPSC — down")
+ora_up_EC_vs_eMPC     <- run_ora(up_EC_vs_eMPC,     background_genes, "EC vs eMPC — up")
+ora_down_EC_vs_eMPC   <- run_ora(down_EC_vs_eMPC,   background_genes, "EC vs eMPC — down")
+ora_up_EC_vs_iPSC     <- run_ora(up_EC_vs_iPSC,     background_genes, "EC vs iPSC — up")
+ora_down_EC_vs_iPSC   <- run_ora(down_EC_vs_iPSC,   background_genes, "EC vs iPSC — down")
+```
+
+```{r ora_simplify, message=FALSE}
+# Step 4: Simplify ORA results — remove semantically redundant GO terms
+# cutoff = 0.7: standard threshold for semantic similarity
+
+simplify_safe <- function(ora_res, label) {
+  if (is.null(ora_res) || nrow(as.data.frame(ora_res)) == 0) {
+    cat(label, ": no terms to simplify\n")
+    return(ora_res)
+  }
+  res <- simplify(ora_res, cutoff = 0.7, by = "p.adjust", select_fun = min)
+  cat(label, ":", nrow(as.data.frame(res)), "terms after simplify()\n")
+  return(res)
+}
+
+cat("=== ORA after simplify() ===\n")
+ora_up_eMPC_vs_iPSC_s   <- simplify_safe(ora_up_eMPC_vs_iPSC,   "eMPC vs iPSC — up")
+ora_down_eMPC_vs_iPSC_s <- simplify_safe(ora_down_eMPC_vs_iPSC, "eMPC vs iPSC — down")
+ora_up_EC_vs_eMPC_s     <- simplify_safe(ora_up_EC_vs_eMPC,     "EC vs eMPC — up")
+ora_down_EC_vs_eMPC_s   <- simplify_safe(ora_down_EC_vs_eMPC,   "EC vs eMPC — down")
+ora_up_EC_vs_iPSC_s     <- simplify_safe(ora_up_EC_vs_iPSC,     "EC vs iPSC — up")
+ora_down_EC_vs_iPSC_s   <- simplify_safe(ora_down_EC_vs_iPSC,   "EC vs iPSC — down")
+```
+
+```{r ora_export, message=FALSE}
+# Export simplified ORA results per direction
+write_xlsx(
+  list(
+    "eMPC_vs_iPSC_up"   = as.data.frame(ora_up_eMPC_vs_iPSC_s),
+    "eMPC_vs_iPSC_down" = as.data.frame(ora_down_eMPC_vs_iPSC_s),
+    "EC_vs_eMPC_up"     = as.data.frame(ora_up_EC_vs_eMPC_s),
+    "EC_vs_eMPC_down"   = as.data.frame(ora_down_EC_vs_eMPC_s),
+    "EC_vs_iPSC_up"     = as.data.frame(ora_up_EC_vs_iPSC_s),
+    "EC_vs_iPSC_down"   = as.data.frame(ora_down_EC_vs_iPSC_s)
+  ),
+  path = "ORA_GO_BP_simplified.xlsx"
+)
+cat("Exported ORA_GO_BP_simplified.xlsx\n")
+```
+
+```{r ora_gsea_comparison, message=FALSE}
+
+# Steps 5-8: Compare ORA with GSEA yes_final by direction and GO ID
+
+# Matching by GO ID avoids mismatches due to naming differences between MSigDB 
+# (fgsea) and org.Hs.eg.db (clusterProfiler). Each term is classified as:
+# - both_exact: present in both GSEA yes_final and simplified ORA
+# - GSEA_only: present only in GSEA yes_final
+# - ORA_only: present only in simplified ORA
+
+# Steps 7-8 (both_related) require manual inspection of the
+# exported files and are documented separately.
+
+
+# Reload GO BP gene sets to retrieve GO IDs for GSEA pathways
+msigdb_GO_BP <- msigdbr(species = "Homo sapiens",
+                         collection    = "C5",
+                         subcollection = "GO:BP")
+
+gsea_go_ids <- msigdb_GO_BP %>%
+  dplyr::select(gs_name, gs_exact_source) %>%
+  dplyr::distinct() %>%
+  dplyr::rename(pathway = gs_name, go_id = gs_exact_source)
+
+# Extract yes_final pathway GO IDs split by NES direction
+get_yes_apriori_ids_by_direction <- function(curation_df) {
+  df <- curation_df %>%
+    filter(include_apriori == "yes_apriori") %>%
+    left_join(gsea_go_ids, by = "pathway")
+  list(
+    pos = df %>% filter(NES > 0) %>% pull(go_id) %>% na.omit(),
+    neg = df %>% filter(NES < 0) %>% pull(go_id) %>% na.omit()
+  )
+}
+
+ids_eMPC_vs_iPSC <- get_yes_apriori_ids_by_direction(curation_eMPC_vs_iPSC)
+ids_EC_vs_eMPC   <- get_yes_apriori_ids_by_direction(curation_EC_vs_eMPC)
+ids_EC_vs_iPSC   <- get_yes_apriori_ids_by_direction(curation_EC_vs_iPSC)
+
+# Classify terms per direction
+classify_terms <- function(ora_s, gsea_ids, direction, contrast_name) {
+  
+  if (is.null(ora_s)) return(data.frame())
+  
+  ora_df    <- as.data.frame(ora_s)
+  ora_ids   <- ora_df$ID
+  
+  # both_exact
+  both_exact <- ora_df[ora_ids %in% gsea_ids,
+                        c("ID", "Description", "p.adjust", "Count", "GeneRatio")] %>%
+    mutate(classification = "both_exact", contrast = contrast_name, direction = direction)
+  
+  # ORA_only
+  ora_only <- ora_df[!ora_ids %in% gsea_ids,
+                      c("ID", "Description", "p.adjust", "Count", "GeneRatio")] %>%
+    mutate(classification = "ORA_only", contrast = contrast_name, direction = direction)
+  
+  # GSEA_only
+  gsea_only_ids <- gsea_ids[!gsea_ids %in% ora_ids]
+  gsea_only <- gsea_go_ids %>%
+    filter(go_id %in% gsea_only_ids) %>%
+    dplyr::select(ID = go_id, Description = pathway) %>%
+    mutate(p.adjust = NA_real_, Count = NA_integer_, GeneRatio = NA_character_,
+           classification = "GSEA_only", contrast = contrast_name, direction = direction)
+  
+  bind_rows(both_exact, ora_only, gsea_only)
+}
+
+# Apply per contrast and direction
+results_all <- bind_rows(
+  classify_terms(ora_up_eMPC_vs_iPSC_s,   ids_eMPC_vs_iPSC$pos, "up",   "eMPC_vs_iPSC"),
+  classify_terms(ora_down_eMPC_vs_iPSC_s, ids_eMPC_vs_iPSC$neg, "down", "eMPC_vs_iPSC"),
+  classify_terms(ora_up_EC_vs_eMPC_s,     ids_EC_vs_eMPC$pos,   "up",   "EC_vs_eMPC"),
+  classify_terms(ora_down_EC_vs_eMPC_s,   ids_EC_vs_eMPC$neg,   "down", "EC_vs_eMPC"),
+  classify_terms(ora_up_EC_vs_iPSC_s,     ids_EC_vs_iPSC$pos,   "up",   "EC_vs_iPSC"),
+  classify_terms(ora_down_EC_vs_iPSC_s,   ids_EC_vs_iPSC$neg,   "down", "EC_vs_iPSC")
+)
+
+# Summary
+cat("=== Classification summary ===\n")
+print(table(results_all$contrast, results_all$classification, results_all$direction))
+
+# Export full classification table for manual inspection (steps 7-8)
+write_xlsx(
+  list("classification" = results_all),
+  path = "ORA_GSEA_classification.xlsx"
+)
+cat("\nExported ORA_GSEA_classification.xlsx\n")
+```
+
+# 10. Side-task: Common/Sustained Expression Programme
+
+Exploratory analysis. Searches within the common gene universe (backbone x GSE271101, n = 11,113) for genes with low/near-zero fold-change magnitude across all three contrasts (L1, L2, L3), regardless of statistical significance, as opposed to the |log2FC| >= 1 threshold used to call DEGs. Magnitude alone is used as the selection criterion, applied across all three contrasts rather than the two sequential legs only; statistical significance is not required at the selection stage. Baseline expression of the resulting set is checked separately (Section 10.4) as a descriptive comparison against the common universe, not as a filtering criterion.
+
+## 10.1 Common gene universe (already computed in Section 6)
+
+```{r sustained_common_universe}
+# Confirm the common-gene intersection is identical across all three
+# contrasts, so a single universe can be used for the whole analysis
+stopifnot(setequal(common_genes_eMPC_vs_iPSC, common_genes_EC_vs_eMPC))
+stopifnot(setequal(common_genes_eMPC_vs_iPSC, common_genes_EC_vs_iPSC))
+
+common_genes_universe <- common_genes_eMPC_vs_iPSC
+length(common_genes_universe)  # expected 11113
+```
+
+## 10.2 Wide-format table (L1/L2/L3, backbone), restricted to common universe
+
+```{r sustained_wide_table}
+# Build a wide table with logFC/AveExpr/t/padj for both sequential
+# transitions (L1 = eMPC-iPSC, L2 = EC-eMPC) plus the full-trajectory
+# contrast (L3), using backbone values only, restricted to the 11,113
+# common genes. AveExpr is kept for the baseline expression check
+# requested in Section 10.4
+
+wide_backbone_sustained <- DEGenes_iPSC_eMPC_backbone %>%
+  dplyr::rename(L1_logFC = logFC, L1_AveExpr = AveExpr, L1_t = t,
+                L1_PValue = P.Value, L1_padj = adj.P.Val) %>%
+  dplyr::select(GeneID, L1_logFC, L1_AveExpr, L1_t, L1_PValue, L1_padj) %>%
+  dplyr::inner_join(
+    DEGenes_eMPC_EC_backbone %>%
+      dplyr::rename(L2_logFC = logFC, L2_AveExpr = AveExpr, L2_t = t,
+                    L2_PValue = P.Value, L2_padj = adj.P.Val) %>%
+      dplyr::select(GeneID, L2_logFC, L2_AveExpr, L2_t, L2_PValue, L2_padj),
+    by = "GeneID"
+  ) %>%
+  dplyr::inner_join(
+    DEGenes_iPSC_EC_backbone %>%
+      dplyr::rename(L3_logFC = logFC, L3_AveExpr = AveExpr, L3_t = t,
+                    L3_PValue = P.Value, L3_padj = adj.P.Val) %>%
+      dplyr::select(GeneID, L3_logFC, L3_AveExpr, L3_t, L3_PValue, L3_padj),
+    by = "GeneID"
+  ) %>%
+  dplyr::filter(GeneID %in% common_genes_universe)
+
+nrow(wide_backbone_sustained)  # expected 11113
+
+# QC check: L3 should approximately equal L1 + L2
+max(abs(wide_backbone_sustained$L3_logFC -
+          (wide_backbone_sustained$L1_logFC + wide_backbone_sustained$L2_logFC)))
+```
+
+## 10.3 Magnitude-only filter, across all three contrasts
+
+```{r sustained_filter}
+# Selection criterion: |log2FC| < c in ALL THREE contrasts (L1, L2, L3),
+# with no significance requirement at this stage. Sensitivity analysis kept at 
+# the same thresholds as before
+# for direct comparison with the earlier (significance-based) version.
+
+thresholds_sustained <- c(0.25, 0.5, 1.0)
+
+sustained_sets <- lapply(thresholds_sustained, function(c) {
+  wide_backbone_sustained %>%
+    dplyr::filter(abs(L1_logFC) < c, abs(L2_logFC) < c, abs(L3_logFC) < c)
+})
+names(sustained_sets) <- paste0("c_", thresholds_sustained)
+
+sapply(sustained_sets, nrow)
+```
+
+## 10.4 Baseline expression check (descriptive, not a filter)
+
+```{r sustained_expression_check}
+# Check whether the sustained set's baseline expression level (AveExpr,
+# before DEG calling) differs from the rest of the common universe.
+# This is descriptive/exploratory - the common universe is already
+# defined by gene detection overlap between datasets, not by similarity
+# of expression level, so no filtering is applied based on this check.
+
+# NOTE ON NAMING: objects in this section are named "sustained"
+# (wide_backbone_sustained, sustained_genes_c0_5, ora_sustained, ...).
+# The thesis refers to this gene set as the "stable" set throughout.
+# The two terms denote exactly the same set: genes with |log2FC| < c in
+# all three backbone contrasts. The object names were kept unchanged to
+# avoid renaming a working chain of dependencies; the display objects
+# created for the figures already use the final terminology
+# (ora_stable_display).
+
+sustained_genes_c0_5 <- sustained_sets[["c_0.5"]]$GeneID
+non_sustained_ids <- setdiff(common_genes_universe, sustained_genes_c0_5)
+
+expr_check <- dplyr::bind_rows(
+  wide_backbone_sustained %>%
+    dplyr::mutate(group = "common_universe_11113"),
+  wide_backbone_sustained %>%
+    dplyr::filter(GeneID %in% sustained_genes_c0_5) %>%
+    dplyr::mutate(group = "sustained_c0_5"),
+  wide_backbone_sustained %>%
+    dplyr::filter(GeneID %in% non_sustained_ids) %>%
+    dplyr::mutate(group = "non_sustained")
+)
+
+expr_check %>%
+  dplyr::group_by(group) %>%
+  dplyr::summarise(
+    median_L1_AveExpr = median(L1_AveExpr),
+    median_L2_AveExpr = median(L2_AveExpr),
+    median_L3_AveExpr = median(L3_AveExpr)
+  )
+
+# Formal test: sustained vs. non-sustained (mutually exclusive groups)
+wilcox.test(
+  wide_backbone_sustained$L1_AveExpr[wide_backbone_sustained$GeneID %in% sustained_genes_c0_5],
+  wide_backbone_sustained$L1_AveExpr[wide_backbone_sustained$GeneID %in% non_sustained_ids],
+  alternative = "greater"
+)
+```
+
+## 10.5 ORA on the sustained set (c = 0.5, provisional)
+
+```{r sustained_ora}
+# c = 0.5 chosen as the primary threshold, consistent with the precedent
+# already used for the near_flat_transition flag in Section 4.6.
+# Background = full common gene universe (11,113), not the whole genome
+sustained_genes <- sustained_sets[["c_0.5"]]$GeneID
+
+ora_sustained <- enrichGO(
+  gene          = sustained_genes,
+  universe      = common_genes_universe,
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "SYMBOL",
+  ont           = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05
+)
+
+ora_sustained_simplified <- simplify(ora_sustained)
+
+# BgRatio: mapped background / total background used internally
+head(ora_sustained@result$BgRatio, 1)
+
+# GeneRatio: mapped input genes / total input genes used internally
+head(ora_sustained@result$GeneRatio, 1)
+```
+
+## 10.6 Export
+
+```{r sustained_export}
+# Export all intermediate objects, so results can be reviewed and the
+# threshold reconsidered without rerunning the full chunk sequence
+write_xlsx(
+  list(
+    common_universe_11113 = data.frame(GeneID = common_genes_universe),
+    sustained_c0_25        = sustained_sets[["c_0.25"]],
+    sustained_c0_5         = sustained_sets[["c_0.5"]],
+    sustained_c1_0         = sustained_sets[["c_1"]],
+    baseline_expression_check = expr_check %>%
+      dplyr::group_by(group) %>%
+      dplyr::summarise(
+        median_L1_AveExpr = median(L1_AveExpr),
+        median_L2_AveExpr = median(L2_AveExpr),
+        median_L3_AveExpr = median(L3_AveExpr)
+      ),
+    ora_sustained_results  = as.data.frame(ora_sustained_simplified)
+  ),
+  "sustained_programme_results_v2.xlsx"
+)
+```
+
+## 10.7 Visualization
+
+```{r ora_stable_dotplot, fig.width=8, fig.height=6}
+# Dotplot of enriched GO BP terms in the stable gene set (c = 0.5).
+# The 15 terms with the lowest adjusted p-value (out of 41) are shown.
+# Term names are converted to Title Case for display (acronyms such as
+# RNA, ATP and mRNA are kept; short words such as "of" and "to" stay
+# lowercase). No plot title: the thesis caption describes the figure.
+
+library(enrichplot)
+
+title_case_go <- function(x) {
+  small <- c("of", "to", "by", "via", "the", "and", "in", "into",
+             "from", "for", "on", "at", "a", "an", "or")
+  cap_word <- function(w, first) {
+    parts <- strsplit(w, "-", fixed = TRUE)[[1]]
+    parts <- vapply(seq_along(parts), function(i) {
+      p <- parts[i]
+      if (grepl("[A-Z]", p)) return(p)                    # keep RNA, ATP, mRNA, K48
+      if (!(first && i == 1) && p %in% small) return(p)   # keep short words lowercase
+      paste0(toupper(substr(p, 1, 1)), substr(p, 2, nchar(p)))
+    }, character(1))
+    paste(parts, collapse = "-")
+  }
+  vapply(x, function(s) {
+    words <- strsplit(s, " ", fixed = TRUE)[[1]]
+    paste(vapply(seq_along(words), function(i) cap_word(words[i], i == 1),
+                 character(1)), collapse = " ")
+  }, character(1), USE.NAMES = FALSE)
+}
+
+# Display copy of the ORA result with Title Case term names
+ora_stable_display <- ora_sustained_simplified
+ora_stable_display@result$Description <- title_case_go(ora_stable_display@result$Description)
+
+# Check: first term names after conversion
+head(ora_stable_display@result$Description, 10)
+
+dotplot(ora_stable_display, showCategory = 15) +
+  labs(colour = expression(italic(p)[adj])) +
+  theme(axis.text.y = element_text(size = 8))
+```
+
+```{r ora_stable_cnetplot, fig.width=9, fig.height=8}
+# Gene-concept network: shows how genes are shared across the enriched
+# GO BP terms (8 terms shown). node_label = "category" keeps only term
+# names visible. Uses the Title Case display copy (ora_stable_display)
+# created in the dotplot chunk. No plot title.
+
+cnetplot(ora_stable_display,
+         showCategory = 8,
+         node_label = "category",
+         layout = "kk") +
+  # Manual legend layer: invisible points, purely to label node colour
+  geom_point(
+    data = data.frame(x = NA_real_, y = NA_real_,
+                      node_type = c("GO term", "Gene")),
+    aes(x = x, y = y, colour = node_type),
+    inherit.aes = FALSE, size = 0
+  ) +
+  scale_colour_manual(
+    name = NULL,
+    values = c("GO term" = "#E5C494", "Gene" = "grey70")
+  ) +
+  guides(colour = guide_legend(override.aes = list(size = 5, alpha = 1)))
+```
+
+## 10.8 Gene-level detail: which genes make up the sustained programme
+
+```{r sustained_gene_term_table}
+gene_term_table <- ora_sustained_simplified@result %>%
+  dplyr::filter(p.adjust < 0.05) %>%
+  dplyr::select(Description, Count, p.adjust, geneID) %>%
+  tidyr::separate_rows(geneID, sep = "/") %>%
+  dplyr::rename(GeneSymbol = geneID)
+
+gene_term_overlap <- gene_term_table %>%
+  dplyr::count(GeneSymbol, sort = TRUE) %>%
+  dplyr::filter(n > 1)
+
+head(gene_term_overlap, 15)
+```
+
+```{r sustained_gene_term_values}
+gene_term_with_values <- gene_term_table %>%
+  dplyr::left_join(
+    sustained_sets[["c_0.5"]] %>%
+      dplyr::select(GeneID, L1_logFC, L2_logFC, L3_logFC),
+    by = c("GeneSymbol" = "GeneID")
+  ) %>%
+  dplyr::arrange(Description, GeneSymbol)
+
+head(gene_term_with_values, 10)
+```
+
+```{r sustained_export_gene_term}
+write_xlsx(
+  list(
+    gene_term_associations = gene_term_table,
+    gene_term_with_values  = gene_term_with_values
+  ),
+  "sustained_programme_gene_term_table_v2.xlsx"
+)
+```
+
+# 11. Sustained Programme — Primary Threshold Justification
+
+The primary magnitude threshold (c = 0.5) is justified here by comparing it against a stricter alternative (c = 0.25). If the genes added when relaxing the threshold from 0.25 to 0.5 show the same general functional profile as the c = 0.5 set as a whole, extending the threshold introduces no new biological signal, and c = 0.5 can be retained as primary. If instead this additional gene set shows lineage-specific enrichment (endothelial, mesoderm, or pluripotency terms), c = 0.25 would be the more conservative and defensible choice. c = 1.0 is excluded from this comparison, as it was already identified as too permissive in the earlier sensitivity analysis (Section 10.3).
+
+## 11.1 Over-representation analysis at c = 0.25
+
+```{r sustained_ora_c025}
+sustained_genes_c0_25 <- sustained_sets[["c_0.25"]]$GeneID
+length(sustained_genes_c0_25)  # expected 717
+
+ora_sustained_c025 <- enrichGO(
+  gene          = sustained_genes_c0_25,
+  universe      = common_genes_universe,
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "SYMBOL",
+  ont           = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05
+)
+
+ora_sustained_c025_simplified <- simplify(ora_sustained_c025)
+nrow(ora_sustained_c025_simplified@result %>% dplyr::filter(p.adjust < 0.05))
+```
+
+## 11.2 Genes gained between c = 0.25 and c = 0.5
+
+```{r sustained_diff_set}
+# Genes included in the c = 0.5 set but not in the stricter c = 0.25 set
+diff_genes_0.5_minus_0.25 <- setdiff(sustained_genes_c0_5, sustained_genes_c0_25)
+length(diff_genes_0.5_minus_0.25)  # expected 1577
+
+ora_diff_set <- enrichGO(
+  gene          = diff_genes_0.5_minus_0.25,
+  universe      = common_genes_universe,
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "SYMBOL",
+  ont           = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05
+)
+
+ora_diff_set_simplified <- simplify(ora_diff_set)
+nrow(ora_diff_set_simplified@result %>% dplyr::filter(p.adjust < 0.05))
+
+# Check specifically for lineage-related terms among the significant results
+ora_diff_set_simplified@result %>%
+  dplyr::filter(p.adjust < 0.05) %>%
+  dplyr::filter(grepl("endothel|vascular|angiog|mesoderm|pluripotenc|stem cell",
+                       Description, ignore.case = TRUE))
+```
+
+## 11.3 Gene-level tracking table for this gene set
+
+```{r sustained_diff_tracking_table}
+
+diff_gene_term_table <- ora_diff_set_simplified@result %>%
+  dplyr::filter(p.adjust < 0.05) %>%
+  dplyr::select(Description, Count, p.adjust, geneID) %>%
+  tidyr::separate_rows(geneID, sep = "/") %>%
+  dplyr::rename(GeneSymbol = geneID)
+
+# Full table of all 1,577 genes, with L1/L2/L3 values and the enriched
+# terms each gene belongs to, where applicable
+diff_tracking_table <- wide_backbone_sustained %>%
+  dplyr::filter(GeneID %in% diff_genes_0.5_minus_0.25) %>%
+  dplyr::select(GeneID, L1_logFC, L2_logFC, L3_logFC) %>%
+  dplyr::left_join(
+    diff_gene_term_table %>%
+      dplyr::group_by(GeneSymbol) %>%
+      dplyr::summarise(GO_terms = paste(Description, collapse = "; "), .groups = "drop"),
+    by = c("GeneID" = "GeneSymbol")
+  )
+
+nrow(diff_tracking_table)  # expected 1577
+sum(is.na(diff_tracking_table$GO_terms))  # genes with no significant term membership
+```
+
+## 11.4 Baseline expression at the stricter threshold (c = 0.25)
+
+```{r sustained_baseline_c025}
+# Repeats the baseline expression comparison (Section 10.4) at c = 0.25,
+# to check whether the higher-expression pattern seen at c = 0.5 holds
+# at a stricter threshold or is specific to the primary set
+
+non_sustained_ids_c025 <- setdiff(common_genes_universe, sustained_genes_c0_25)
+
+expr_check_c025 <- dplyr::bind_rows(
+  wide_backbone_sustained %>%
+    dplyr::filter(GeneID %in% sustained_genes_c0_25) %>%
+    dplyr::mutate(group = "sustained_c0_25"),
+  wide_backbone_sustained %>%
+    dplyr::filter(GeneID %in% non_sustained_ids_c025) %>%
+    dplyr::mutate(group = "non_sustained_c0_25")
+)
+
+expr_check_c025 %>%
+  dplyr::group_by(group) %>%
+  dplyr::summarise(median_AveExpr = median(L1_AveExpr))
+
+wilcox.test(
+  wide_backbone_sustained$L1_AveExpr[wide_backbone_sustained$GeneID %in% sustained_genes_c0_25],
+  wide_backbone_sustained$L1_AveExpr[wide_backbone_sustained$GeneID %in% non_sustained_ids_c025],
+  alternative = "greater"
+)
+```
+
+## 11.5 Export
+
+```{r sustained_threshold_export}
+write_xlsx(
+  list(
+    ora_c0_25              = as.data.frame(ora_sustained_c025_simplified),
+    ora_diff_set           = as.data.frame(ora_diff_set_simplified),
+    diff_tracking_table    = diff_tracking_table,
+    baseline_expr_c0_25    = expr_check_c025 %>%
+      dplyr::group_by(group) %>%
+      dplyr::summarise(median_AveExpr = median(L1_AveExpr))
+  ),
+  "sustained_threshold_justification.xlsx"
+)
+```
+
+
+## 11.6 Average Expression Figure
+
+```{r aveexpr_violin_stable, fig.width=8, fig.height=4.5}
+# Average expression (AveExpr, log2-CPM) of stable genes vs. the remaining
+# genes of the common universe, for thresholds c = 0.5 (A) and c = 0.25 (B).
+# Stable = |log2FC| < c in all three backbone contrasts (L1, L2, L3).
+# Violins use scale = "width" (same maximum width), so violin width does not
+# reflect group size; group sizes are shown in the x-axis labels.
+# Same y-axis scale in both panels; no statistical annotations (tests are
+# reported in the text).
+
+library(ggplot2)
+library(dplyr)
+
+aveexpr_tbl <- wide_backbone_sustained %>%
+  dplyr::select(GeneID, AveExpr = L1_AveExpr, L1_logFC, L2_logFC, L3_logFC)
+
+# Check: number of genes in the common universe (expect 11113)
+nrow(aveexpr_tbl)
+
+make_groups <- function(c_thr, panel_label) {
+  aveexpr_tbl %>%
+    dplyr::mutate(
+      stable = abs(L1_logFC) < c_thr & abs(L2_logFC) < c_thr & abs(L3_logFC) < c_thr,
+      group  = ifelse(stable, "Stable", "Other genes"),
+      panel  = panel_label
+    )
+}
+
+plot_df <- dplyr::bind_rows(
+  make_groups(0.5,  "(A) c = 0.5"),
+  make_groups(0.25, "(B) c = 0.25")
+)
+
+# Check: group sizes (expect 2,294 / 8,819 and 717 / 10,396)
+print(dplyr::count(plot_df, panel, group))
+
+# Check: c = 0.5 stable set matches the existing object (expect TRUE)
+setequal(plot_df$GeneID[plot_df$panel == "(A) c = 0.5" & plot_df$group == "Stable"],
+         sustained_genes_c0_5)
+
+# x-axis labels with group sizes
+plot_df <- plot_df %>%
+  dplyr::group_by(panel, group) %>%
+  dplyr::mutate(n = dplyr::n()) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(
+    group_label = paste0(group, "\n(n = ", format(n, big.mark = ",", trim = TRUE), ")"),
+    panel       = factor(panel, levels = c("(A) c = 0.5", "(B) c = 0.25")),
+    group       = factor(group, levels = c("Stable", "Other genes"))
+  ) %>%
+  dplyr::arrange(panel, group) %>%
+  dplyr::mutate(group_label = factor(group_label, levels = unique(group_label)))
+
+p_aveexpr <- ggplot(plot_df, aes(x = group_label, y = AveExpr, fill = group)) +
+  geom_violin(scale = "width", trim = TRUE, color = NA, alpha = 0.6) +
+  geom_boxplot(width = 0.12, outlier.shape = NA, fill = "white", color = "grey20") +
+  scale_fill_manual(values = c("Stable" = "#B2182B", "Other genes" = "#2166AC")) +
+  facet_wrap(~ panel, scales = "free_x") +
+  labs(x = NULL, y = expression("Average expression (" * log[2] * "-CPM)")) +
+  theme_bw(base_size = 11) +
+  theme(
+    legend.position  = "none",
+    strip.background = element_rect(fill = "grey95", color = NA),
+    strip.text       = element_text(face = "bold"),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank()
+  )
+
+p_aveexpr
+```
+
+## 11.7 Lineage-keyword screen before simplify()
+
+```{r lineage_keyword_screen_pre_simplify}
+# Checks whether lineage-related GO terms were present among the significant
+# terms BEFORE redundancy reduction with simplify(), for both the c = 0.5
+# stable set and the difference set (genes in c = 0.5 but not in c = 0.25).
+# This verifies that the absence of lineage-related terms after simplify()
+# is not a consequence of redundancy reduction.
+# Keywords are the same as in the predefined lineage screen.
+
+lineage_kw <- "endothel|vascular|angiog|mesoderm|pluripotenc|stem cell"
+
+screen_lineage <- function(ora_res, label) {
+  res <- as.data.frame(ora_res)
+  res <- res[res$p.adjust < 0.05, ]
+  hits <- res[grepl(lineage_kw, res$Description, ignore.case = TRUE),
+              c("Description", "Count", "p.adjust")]
+  list(
+    summary = data.frame(set = label,
+                         significant_terms = nrow(res),
+                         lineage_terms = nrow(hits)),
+    hits = hits
+  )
+}
+
+screens <- list(
+  screen_lineage(ora_sustained,              "c = 0.5, before simplify()"),
+  screen_lineage(ora_sustained_simplified,   "c = 0.5, after simplify()"),
+  screen_lineage(ora_diff_set,               "Difference set, before simplify()"),
+  screen_lineage(ora_diff_set_simplified,    "Difference set, after simplify()")
+)
+
+# Summary table (expect 102 / 41 / 22 / 11 significant terms, 0 lineage terms)
+lineage_screen_summary <- dplyr::bind_rows(lapply(screens, `[[`, "summary"))
+print(lineage_screen_summary)
+
+# Lineage-related terms found, if any (expect none)
+lineage_hits <- dplyr::bind_rows(lapply(screens, function(s) s$hits))
+if (nrow(lineage_hits) == 0) {
+  cat("No lineage-related terms found before or after simplify().\n")
+} else {
+  print(lineage_hits)
+}
+```

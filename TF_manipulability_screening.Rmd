@@ -1,0 +1,229 @@
+---
+title: "TF Pharmacological Manipulability Screening"
+output:
+  pdf_document:
+        latex_engine: xelatex
+  html_document: default
+header-includes:
+  - \usepackage{fvextra}
+  - \DefineVerbatimEnvironment{Highlighting}{Verbatim}{breaklines,commandchars=\\\{\}}
+date: "`r Sys.Date()`"  
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(fig.path = "figures/", dev = c("png", "pdf"), dpi = 300)
+```
+
+```{r libraries, message=FALSE}
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(writexl)
+library(tibble)
+```
+
+# 1. Load source tables
+
+```{r load-data}
+# Adjust paths to your working directory convention
+selection_table  <- readxl::read_excel("TF_selection_table.xlsx")
+trajectory_table <- readxl::read_excel("TF_track_trajectory.xlsx", sheet = "tf_trajectory")
+
+# IMPORTANT: confirm actual column names in selection_table before proceeding -
+# some headers were truncated when last reviewed and are not fully confirmed
+colnames(selection_table)
+colnames(trajectory_table)
+
+# Confirm the exact source_pool labels before filtering - these changed
+# once already (from "main (n=46)" to plain "main"), so do not hardcode
+# a value here without checking
+unique(trajectory_table$source_pool)
+```
+
+# 2. Load gene-level expression (L1/L2/L3 logFC), separate from regulon activity
+
+```{r load-expression}
+# DEGs_full_toptable_three_contrasts.xlsx: one sheet per contrast, all
+# genes (not just DEGs). Column convention confirmed from
+# Molecular_Signatures.Rmd / TF_Track.Rmd:
+# L1 = eMPC_vs_iPSC, L2 = EC_vs_eMPC, L3 = EC_vs_iPSC (cumulative, QC only)
+
+d1 <- readxl::read_excel("DEGs_full_toptable_three_contrasts.xlsx", sheet = "eMPC_vs_iPSC") %>%
+  dplyr::rename(L1_logFC = logFC, L1_t = t, L1_pval = P.Value, L1_padj = adj.P.Val)
+d2 <- readxl::read_excel("DEGs_full_toptable_three_contrasts.xlsx", sheet = "EC_vs_eMPC") %>%
+  dplyr::rename(L2_logFC = logFC, L2_t = t, L2_pval = P.Value, L2_padj = adj.P.Val)
+d3 <- readxl::read_excel("DEGs_full_toptable_three_contrasts.xlsx", sheet = "EC_vs_iPSC") %>%
+  dplyr::rename(L3_logFC = logFC, L3_t = t, L3_pval = P.Value, L3_padj = adj.P.Val)
+
+tf_expression_wide <- d1 %>%
+  dplyr::inner_join(d2, by = "GeneID") %>%
+  dplyr::inner_join(d3, by = "GeneID")
+
+# Classify TF gene expression trajectory shape, using the same sign-based
+# logic already applied to regulon activity (trajectory_class in
+# trajectory_table), so the two columns stay in a comparable vocabulary.
+
+tf_expression_wide <- tf_expression_wide %>%
+  dplyr::mutate(
+    TF_expression_pattern = dplyr::case_when(
+      L1_logFC > 0 & L2_logFC > 0 ~ "monotonic_increase",
+      L1_logFC < 0 & L2_logFC < 0 ~ "monotonic_decrease",
+      L1_logFC > 0 & L2_logFC < 0 ~ "eMPC_peak",
+      L1_logFC < 0 & L2_logFC > 0 ~ "eMPC_trough",
+      TRUE ~ "other"
+    )
+  )
+```
+
+# 3. Join selection metadata, trajectory (activity), and expression tables; restrict to the 45 main candidates
+
+```{r join-tables}
+# Work on named copies, never edit the original imported objects.
+
+# selection_table is the authoritative source here, not trajectory_table:
+# it already carries trajectory_class, main_stage (corrected via
+# trough_reassignment_flag), source_pool, and EC_vs_iPSC. Pulling these
+# again from trajectory_table would create duplicate .x/.y columns on
+# join, and would also silently overwrite the corrected main_stage
+# with the uncorrected one.trajectory_table is only needed here 
+# for the two activity columns as selection_table does NOT have: EC_vs_eMPC and 
+# eMPC_vs_iPSC.
+# source_pool values confirmed as exactly "main" / "broad-only" - exact
+# match is used rather than a pattern match.
+
+tf_screening_base <- selection_table %>%
+  dplyr::filter(source_pool == "main") %>%
+  dplyr::left_join(
+    trajectory_table %>%
+      dplyr::select(source, EC_vs_eMPC, eMPC_vs_iPSC),
+    by = c("TF" = "source")
+  ) %>%
+  dplyr::left_join(
+    tf_expression_wide %>%
+      dplyr::select(GeneID, L1_logFC, L2_logFC, L3_logFC, TF_expression_pattern),
+    by = c("TF" = "GeneID")
+  )
+
+# Sanity checks - do not proceed to Section 4 until these look right
+nrow(tf_screening_base)              # expect 45
+sum(!is.na(tf_screening_base$selected_main_figure) &
+      tf_screening_base$selected_main_figure)   # expect 10 TRUE among these
+dplyr::filter(tf_screening_base, is.na(trajectory_class))      # should be empty
+dplyr::filter(tf_screening_base, is.na(TF_expression_pattern)) 
+     # should be empty - flags a join mismatch if not
+dplyr::filter(tf_screening_base, is.na(EC_vs_eMPC) | is.na(eMPC_vs_iPSC)) # should be empty
+```
+
+# 4. Build the screening table skeleton
+
+```{r build-skeleton}
+# Empty literature-derived columns to be filled manually, starting with
+# the 10 TFs flagged selected_main_figure == TRUE, then the remaining 35
+
+tf_screening_table <- tf_screening_base %>%
+  dplyr::transmute(
+    TF = TF,
+    source_pool = source_pool,
+    main_stage = main_stage,
+    regulon_activity_pattern = trajectory_class,        
+    # regulon-activity-based (already computed in selection_table)
+    TF_expression_pattern = TF_expression_pattern,      
+    # gene-level, computed in Section 2
+    eMPC_vs_iPSC_activity = eMPC_vs_iPSC,
+    EC_vs_eMPC_activity = EC_vs_eMPC,
+    EC_vs_iPSC_activity = EC_vs_iPSC,                   
+    # already present in selection_table
+    L1_logFC = L1_logFC,
+    L2_logFC = L2_logFC,
+    L3_logFC = L3_logFC,
+    selected_main_figure = selected_main_figure,
+    selection_reason = reason,
+
+    # columns to fill manually during literature screening
+    upstream_pathway = NA_character_,
+    intervention = NA_character_,
+    intervention_type = NA_character_,        
+    # small molecule / growth factor / ligand / other pharmacological
+    direct_indirect = NA_character_,
+    intervention_effect = NA_character_,      
+    # activate / inhibit - on whichever target the intervention actually acts on 
+    # (TF, upstream receptor/kinase, or pathway node)
+    direction_vs_observed_trajectory = NA_character_, 
+    # same / opposite / context-dependent / unclear
+    differentiation_context = NA_character_,
+    literature_evidence_type = NA_character_, 
+    # e.g. direct TF modulation / pathway-level / adjacent context only
+    evidence_level = NA_character_,           
+    # strong / moderate / mechanistic_only / none_found
+    reference = NA_character_,
+    notes = NA_character_
+  ) %>%
+  dplyr::arrange(
+    dplyr::desc(selected_main_figure), # the 10 priority TFs first
+    main_stage
+  )
+
+# Audit trail - keep a timestamped copy before any manual edits
+tf_screening_table
+```
+
+# 5. Pre-fill the pathway-level findings from the first search pass (SMAD3, NOTCH1/HEY1, LEF1)
+
+```{r prefill-confirmed}
+
+confirmed_entries <- tibble::tribble(
+  ~TF,      ~upstream_pathway,          ~intervention, ~intervention_type, ~direct_indirect,                                                                    ~intervention_effect, ~direction_vs_observed_trajectory,                                                                          ~differentiation_context,                                                          ~literature_evidence_type,           ~evidence_level, ~reference,                                                       ~status,
+  "SMAD3",  "TGF-beta/ALK4-5-7",        "SB431542",    "small molecule",   "indirect (acts on ALK5/4/7 receptor upstream of SMAD2/3)",                          "inhibit",             "context-dependent (inhibition of the pathway upstream of SMAD3 promotes EC identity in these protocols)", "hPSC/hESC endothelial differentiation and maintenance",                          "pathway-level, protocol use confirmed", "strong",        "Watabe et al. 2003 J Cell Biol; James et al. 2010",             "provisional - pending full-text verification",
+  "NOTCH1", "NOTCH (gamma-secretase)",  "DAPT",        "small molecule",   "indirect (blocks gamma-secretase cleavage, not selective for NOTCH1 vs NOTCH2-4)", "inhibit",             "opposite (DAPT pushes toward venous fate; NOTCH1 activity increases toward EC here)",                     "iPSC-derived venous EC generation; arterial hemogenic endothelium specification", "pathway-level, protocol use confirmed", "strong",        "Lee et al. 2024 Cell Stem Cell; Ditadi et al. 2018 Nat Commun", "provisional - pending full-text verification",
+  "HEY1",   "NOTCH (gamma-secretase)",  "DAPT",        "small molecule",   "indirect (HEY1 is a direct NOTCH target gene, not itself druggable)",              "inhibit",             "unclear (HEY1 is a transcriptional readout of Notch activity, not tested independently)",                 "same protocols as NOTCH1 above",                                                  "pathway-level, protocol use confirmed", "strong",        "Lee et al. 2024 Cell Stem Cell; Ditadi et al. 2018 Nat Commun", "provisional - pending full-text verification",
+  "LEF1",   "WNT/beta-catenin (GSK3)",  "CHIR99021",   "small molecule",   "indirect (GSK3beta inhibitor stabilises beta-catenin, which complexes with LEF1/TCF)", "activate",          "unclear (LEF1 is a transcriptional effector of Wnt activation, not tested independently)",                "hPSC endothelial and smooth muscle cell differentiation (mesoderm induction)",    "pathway-level, protocol use confirmed", "strong",        "Patsch et al. 2015 Nat Cell Biol",  "provisional - pending full-text verification"
+)
+
+tf_screening_table <- tf_screening_table %>%
+  dplyr::mutate(status = NA_character_) %>%  # add the column to the full table first
+  dplyr::rows_update(confirmed_entries, by = "TF", unmatched = "ignore")
+
+# double-check the update landed correctly before exporting
+dplyr::filter(tf_screening_table, TF %in% c("SMAD3", "NOTCH1", "HEY1", "LEF1"))
+```
+
+# 6. Export for manual curation
+
+```{r export}
+writexl::write_xlsx(
+  tf_screening_table,
+  path = paste0("TF_manipulability_screening_", Sys.Date(), ".xlsx")
+)
+```
+
+# 7. Workflow reminder (for reference while filling the table)
+
+- Priority order: the 10 `selected_main_figure == TRUE` rows first, followed
+  by the remaining 35 primary candidates. The 7 broad-only TFs were not
+  included in the systematic screening.
+
+- Per TF: direct TF modulation search -> canonical pathway compound
+  shortcut (TGF-beta/Wnt/Notch/BMP tool compounds) -> generic pathway
+  search where necessary -> evaluation of evidence in differentiation
+  and/or endothelial contexts.
+
+- `intervention_type`: keep small molecules distinct from growth
+  factors/ligands and other pharmacological agents. Small molecules were
+  the primary focus of the screening; ligands were retained as
+  complementary examples of pathway manipulation.
+
+- Direct and indirect modulation should be distinguished explicitly.
+  Indirect interventions act through an upstream receptor, kinase or
+  signaling pathway rather than on the TF/regulator itself.
+
+- Use `none_found` only after systematic screening failed to identify a
+  sufficiently specific and relevant pharmacological intervention.
+
+- The four entries pre-filled in Section 5 were used only to initialize
+  the manual curation table. Final intervention assignments,
+  direct/indirect classifications, evidence levels and references were
+  subsequently reviewed and updated manually in the exported Excel file.
+
+- No need to re-run this Rmd after export; the curated Excel file is the
+  final record used for interpretation.

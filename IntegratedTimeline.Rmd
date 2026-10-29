@@ -1,0 +1,530 @@
+---
+title: "Integrated Differentiation Timeline"
+output:
+  pdf_document:
+        latex_engine: xelatex
+  html_document: default
+header-includes:
+  - \usepackage{fvextra}
+  - \DefineVerbatimEnvironment{Highlighting}{Verbatim}{breaklines,commandchars=\\\{\}}  
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(fig.path = "figures/", dev = c("png", "pdf"), dpi = 300)
+```
+
+```{r libraries, message=FALSE}
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(writexl)
+library(ggplot2)
+```
+
+```{r setup_dir}
+setwd("~/Desktop/Tese/R/Transcriptomic analysis")
+```
+
+# 1. Build the Signalling Pathways Track
+
+```{r build_signalling_track}
+# Cross-reference the six named Hallmark signalling processes against 
+# the corresponding yes_apriori GO BP module. Module
+# mapping is a manual, documented design choice (Section 3.2.17), not
+# derived automatically.
+
+hallmark_terms <- c(
+  "HALLMARK_WNT_BETA_CATENIN_SIGNALING",
+  "HALLMARK_COAGULATION",
+  "HALLMARK_COMPLEMENT",
+  "HALLMARK_TNFA_SIGNALING_VIA_NFKB",
+  "HALLMARK_G2M_CHECKPOINT",
+  "HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION"
+)
+
+module_lookup <- tibble::tribble(
+  ~pathway,                                       ~GO_BP_module,
+  "HALLMARK_WNT_BETA_CATENIN_SIGNALING",          "wnt_mesoderm_pluripotency",
+  "HALLMARK_COAGULATION",                          "coagulation_hemostasis",
+  "HALLMARK_COMPLEMENT",                           "immune_inflammatory_response",
+  "HALLMARK_TNFA_SIGNALING_VIA_NFKB",              "immune_inflammatory_response",
+  "HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION",    "epithelial_mesenchymal_transition",
+  "HALLMARK_G2M_CHECKPOINT",                       "NOT COVERED BY GO BP MODULES"
+)
+
+read_hallmark_sheet <- function(sheet_name, contrast_label) {
+  read_excel("GSEA_Hallmark_common.xlsx", sheet = sheet_name) %>%
+    dplyr::filter(pathway %in% hallmark_terms) %>%
+    dplyr::mutate(contrast = contrast_label) %>%
+    dplyr::select(pathway, contrast, NES, padj)
+}
+
+signalling_track <- dplyr::bind_rows(
+  read_hallmark_sheet("eMPC_vs_iPSC", "eMPC_vs_iPSC"),
+  read_hallmark_sheet("EC_vs_eMPC",   "EC_vs_eMPC"),
+  read_hallmark_sheet("EC_vs_iPSC",   "EC_vs_iPSC")
+) %>%
+  dplyr::left_join(module_lookup, by = "pathway") %>%
+  dplyr::mutate(process = gsub("HALLMARK_", "", pathway)) %>%
+  dplyr::select(process, GO_BP_module, contrast, NES, padj)
+
+write_xlsx(list("signalling_track" = signalling_track), path = "signalling_track.xlsx")
+cat("Exported signalling_track.xlsx —", nrow(signalling_track), "rows\n")
+print(as.data.frame(signalling_track))
+
+#The result is 18 as the Hallmark result is 6, and this runs across the 3 contrasts.
+```
+
+# 2. Transcription Factor Track (Read and Prepare)
+
+```{r load_tf_data}
+# TF evidence and trajectory tables are built and exported in
+# TF_Track.Rmd. Read here rather than rebuilt.
+
+evidence_table <- read_excel("TF_track_evidence_table.xlsx", sheet = "tf_evidence_table")
+tf_trajectory  <- read_excel("TF_track_trajectory.xlsx", sheet = "tf_trajectory")
+write.csv(le_all, "leading_edge_long_table.csv", row.names = FALSE)
+
+cat("TF trajectory table loaded:", nrow(tf_trajectory), "TFs\n")
+```
+
+```{r build_tf_selection_table}
+
+# Build the selection table used to decide which TFs enter the main
+# figure. is_leading_edge is not included as a selection variable:
+# all TFs in tf_trajectory already have leading-edge evidence.
+# The 45 main TFs satisfy all three evidence criteria under the
+# standard threshold, while the 7 broad-only TFs satisfy all three
+# under the relaxed DEG threshold. Therefore, leading-edge membership
+# does not discriminate among candidates at this stage.
+
+tf_module_lookup <- le_all %>%
+  dplyr::filter(gene %in% tf_trajectory$source) %>%
+  dplyr::group_by(gene) %>%
+  dplyr::summarise(biological_module = paste(sort(unique(biological_category)), collapse = "; "),
+                    .groups = "drop")
+
+tf_selection_table <- tf_trajectory %>%
+  dplyr::left_join(
+    evidence_table %>% dplyr::select(TF, n_evidence_types, n_significant_contrasts),
+    by = c("source" = "TF")
+  ) %>%
+  dplyr::rowwise() %>%
+  dplyr::mutate(max_abs_activity = max(abs(c(eMPC_vs_iPSC, EC_vs_eMPC, EC_vs_iPSC)))) %>%
+  dplyr::ungroup() %>%
+  dplyr::left_join(tf_module_lookup, by = c("source" = "gene")) %>%
+  dplyr::mutate(
+    main_stage = dplyr::case_when(
+      trajectory_class %in% c("eMPC_peak", "eMPC_trough") ~ "eMPC",
+      trajectory_class == "monotonic_increase" ~ "EC",
+      trajectory_class == "monotonic_decrease" ~ "iPSC",
+      TRUE ~ "other"
+    ),
+    selected_main_figure = NA,  # populated below based on the finalized manual selection criteria
+    reason = NA_character_
+  ) %>%
+  dplyr::select(
+    TF = source, n_evidence_types, n_significant_contrasts, max_abs_activity,
+    trajectory_class, main_stage, biological_module,
+    source_pool, selected_main_figure, reason
+  ) %>%
+  dplyr::arrange(dplyr::desc(n_evidence_types), dplyr::desc(max_abs_activity))
+
+write_xlsx(list("tf_selection_table" = tf_selection_table), path = "TF_selection_table.xlsx")
+cat("Exported TF_selection_table.xlsx —", nrow(tf_selection_table), "TFs\n")
+print(as.data.frame(tf_selection_table))
+```
+## 2.1. QC Stage Flag
+
+```{r tf_stage_flag_qc}
+tf_selection_table <- tf_selection_table %>%
+  dplyr::left_join(
+    evidence_table %>% dplyr::select(TF, contrasts_significant),
+    by = "TF"
+  ) %>%
+  dplyr::mutate(
+    leg1_sig = grepl("eMPC_vs_iPSC", contrasts_significant),
+    leg2_sig = grepl("EC_vs_eMPC", contrasts_significant),
+    stage_flag = dplyr::case_when(
+      !(trajectory_class %in% c("eMPC_peak", "eMPC_trough")) ~ NA_character_,
+      leg1_sig & leg2_sig ~ NA_character_,
+      leg2_sig & !leg1_sig ~ "eMPC_vs_iPSC leg not significant",
+      leg1_sig & !leg2_sig ~ "EC_vs_eMPC leg not significant",
+      TRUE ~ "neither leg significant"
+    )
+  )
+```
+
+## 2.2. Main stage Re-definition
+
+```{r tf_main_stage_corrected}
+# eMPC_peak: by construction eMPC exceeds both flanks — main_stage =
+# "eMPC" needs no further check. eMPC_trough is the opposite case:
+# eMPC is where activity is LOWEST, so "where is this TF most active"
+# requires comparing the two flanks (EC_vs_iPSC) instead of defaulting
+# to eMPC. leg3_sig flags whether that comparison itself is
+# statistically supported.
+
+tf_selection_table <- tf_selection_table %>%
+  dplyr::left_join(
+    tf_trajectory %>% dplyr::select(source, EC_vs_iPSC),
+    by = c("TF" = "source")
+  ) %>%
+  dplyr::mutate(
+    leg3_sig = grepl("EC_vs_iPSC", contrasts_significant),
+    main_stage = dplyr::case_when(
+      trajectory_class == "monotonic_increase" ~ "EC",
+      trajectory_class == "monotonic_decrease" ~ "iPSC",
+      trajectory_class == "eMPC_peak" ~ "eMPC",
+      trajectory_class == "eMPC_trough" & EC_vs_iPSC > 0 ~ "EC",
+      trajectory_class == "eMPC_trough" & EC_vs_iPSC < 0 ~ "iPSC",
+      TRUE ~ NA_character_
+    ),
+    trough_reassignment_flag = dplyr::if_else(
+      trajectory_class == "eMPC_trough" & !leg3_sig,
+      "EC_vs_iPSC not significant — reassignment based on sign only",
+      NA_character_
+    )
+  )
+
+cat("=== main_stage reassignment check (eMPC_trough only) ===\n")
+tf_selection_table %>%
+  dplyr::filter(source_pool == "main", trajectory_class == "eMPC_trough") %>%
+  dplyr::count(main_stage, trough_reassignment_flag)
+```
+
+## 2.3. Inspect Updated TF Candidates
+
+```{r inspect_updated_tf_candidates}
+
+tf_selection_table %>%
+  dplyr::arrange(
+    main_stage,
+    dplyr::desc(n_significant_contrasts),
+    dplyr::desc(max_abs_activity)
+  ) %>%
+  dplyr::select(
+    TF,
+    source_pool,
+    main_stage,
+    trajectory_class,
+    n_significant_contrasts,
+    max_abs_activity,
+    biological_module
+  ) %>%
+  print(n = Inf)
+```
+
+
+# 3. Cellular Functions Track (Read and Prepare)
+
+```{r load_module_scores}
+# Module scores (mean z-score per module per sample) already computed
+# in Molecular_Signatures.Rmd, Section 10.
+
+module_scores <- read_excel("module_scores_by_sample.xlsx")
+cat("Module scores loaded:", nrow(module_scores), "modules,", ncol(module_scores) - 1, "samples\n")
+```
+
+# 4. Apply TF Selection Criteria for the Main Figure
+
+```{r apply_tf_selection}
+# Main-figure selection: 1-2 representative TFs per main_stage x
+# dominant biological theme, chosen to maximise n_significant_contrasts
+# and max_abs_activity while avoiding redundant TFs from the same
+# biological block (e.g. only one of ZEB1/ZEB2/SNAI1/SNAI2 for EMT).
+# NOTCH1 is retained despite not ranking among the strongest TFs by
+# activity magnitude, given its central, highly pleiotropic role across
+# 11 biological modules. This is a manually curated selection,
+# not an automated ranking — documented explicitly here rather than
+# derived by a formula, consistent with the reasoning in Section 3
+# (TF_Track.Rmd) that a pure numerical ranking risks biasing the
+# figure toward a single contrast or function.
+
+selected_tfs <- tibble::tribble(
+  ~TF,      ~reason,
+  "ZEB2",    "EC-associated; EMT block representative (avoids redundancy with ZEB1/SNAI1/SNAI2)",
+  "RELA",    "EC-associated; together with NFKB1, represents the canonical NF-kB heterodimer (RelA/p50) — both subunits activated at the EC stage",
+  "SMAD3",   "EC-associated; TGF-beta/BMP block representative",
+  "GATA2",   "EC-associated; endothelial/vascular identity",
+  "NOTCH1",  "EC-associated; central pleiotropic regulator (11 biological modules), retained despite modest per-contrast significance relative to other EC candidates",
+  "LEF1",    "eMPC-associated (eMPC_peak); canonical WNT effector",
+  "NFKB1",   "EC-associated (eMPC_trough, reassigned to EC because inferred activity is higher in EC than in iPSC); together with RELA, represents the canonical NF-kB heterodimer (RelA/p50) — both subunits activated at the EC stage",
+  "NR2F2",   "eMPC-associated (eMPC_peak); arterial-venous specification (COUP-TFII)",
+  "HEY1",    "iPSC-associated (monotonic_decrease); retained over higher-evidence alternatives (e.g. HHEX) for its broader leading-edge integration across Notch signalling, endothelium development and blood vessel morphogenesis"
+)
+
+tf_selection_table <- tf_selection_table %>%
+  dplyr::mutate(
+    selected_main_figure = TF %in% selected_tfs$TF,
+    reason = selected_tfs$reason[match(TF, selected_tfs$TF)]
+  )
+
+write_xlsx(list("tf_selection_table" = tf_selection_table), path = "TF_selection_table.xlsx")
+
+cat("Total candidate TFs (full table, exported):", nrow(tf_selection_table), "\n")
+cat("  - marked TRUE (main figure):", sum(tf_selection_table$selected_main_figure), "\n")
+cat("  - marked FALSE (documented only, not in main figure):", sum(!tf_selection_table$selected_main_figure), "\n")
+```
+
+# 5. Prepare Data for the Integrated Figure
+
+```{r prepare_signalling_stage}
+# Assign each signaling process to a main_stage using the sign of the
+# Hallmark NES in the two sequential contrasts (eMPC_vs_iPSC and
+# EC_vs_eMPC), following the same stage-assignment rule used for the
+# TF track (Section 2.2):
+#   +/+ -> EC      (monotonic increase)
+#   -/- -> iPSC    (monotonic decrease)
+#   +/- -> eMPC    (maximum at eMPC)
+#   -/+ -> minimum at eMPC, so the process is reassigned to EC or iPSC
+#          according to the sign of the EC_vs_iPSC NES
+# Statistical significance is not used for stage assignment; padj values
+# are kept in signalling_track for interpretation.
+
+signalling_wide <- signalling_track %>%
+  dplyr::select(process, contrast, NES) %>%
+  tidyr::pivot_wider(names_from = contrast, values_from = NES)
+
+signalling_stage <- signalling_wide %>%
+  dplyr::mutate(
+    main_stage = dplyr::case_when(
+      eMPC_vs_iPSC > 0 & EC_vs_eMPC < 0 ~ "eMPC",
+      eMPC_vs_iPSC < 0 & EC_vs_eMPC > 0 & EC_vs_iPSC > 0 ~ "EC",
+      eMPC_vs_iPSC < 0 & EC_vs_eMPC > 0 & EC_vs_iPSC < 0 ~ "iPSC",
+      eMPC_vs_iPSC > 0 & EC_vs_eMPC > 0 ~ "EC",
+      eMPC_vs_iPSC < 0 & EC_vs_eMPC < 0 ~ "iPSC",
+      TRUE ~ "other"
+    ),
+    track = "Signaling Pathways",
+    label = process
+  ) %>%
+  dplyr::select(track, label, main_stage)
+
+print(signalling_stage)
+```
+
+```{r prepare_cellular_functions_stage}
+# Assign each biological module to a main_stage, using the stage with
+# the highest mean module z-score across its three replicates.
+
+module_scores_long <- module_scores %>%
+  tidyr::pivot_longer(-1, names_to = "sample", values_to = "z_score") %>%
+  dplyr::rename(module = 1) %>%
+  dplyr::mutate(stage = dplyr::case_when(
+    grepl("iPSC", sample) ~ "iPSC",
+    grepl("eMPC", sample) ~ "eMPC",
+    grepl("EC", sample)   ~ "EC"
+  ))
+
+cellular_functions_stage <- module_scores_long %>%
+  dplyr::group_by(module, stage) %>%
+  dplyr::summarise(mean_z = mean(z_score), .groups = "drop") %>%
+  dplyr::group_by(module) %>%
+  dplyr::slice_max(mean_z, n = 1) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(
+    track = "Cellular Functions",
+    label = module,
+    main_stage = stage
+  ) %>%
+  dplyr::select(track, label, main_stage)
+
+print(cellular_functions_stage)
+```
+
+```{r prepare_tf_stage}
+# TF track: only the 9 TFs selected for the main figure.
+
+tf_stage <- tf_selection_table %>%
+  dplyr::filter(selected_main_figure) %>%
+  dplyr::mutate(track = "Transcription Factors", label = TF) %>%
+  dplyr::select(track, label, main_stage)
+
+print(tf_stage)
+```
+
+# 6. Integrated Timeline Figure
+
+```{r finalize_tf_selection}
+# Add HIPK2 as a second iPSC-associated TF alongside HEY1: HIPK2 has
+# higher n_significant_contrasts and max_abs_activity among
+# iPSC-associated (monotonic_decrease) candidates, while HEY1 is
+# retained for its established narrative relevance (Notch effector,
+# discussed elsewhere in the thesis). Both justifications are recorded
+# explicitly rather than favouring one candidate silently.
+
+tf_selection_table <- tf_selection_table %>%
+  dplyr::mutate(
+    selected_main_figure = dplyr::if_else(TF == "HIPK2", TRUE, selected_main_figure),
+    reason = dplyr::if_else(TF == "HIPK2",
+      "iPSC-associated (monotonic_decrease); highest max_abs_activity among the main monotonic-decrease TFs, added alongside HEY1, which was retained for its broader leading-edge integration and Notch-related biological relevance",
+      reason)
+  )
+
+write_xlsx(list("tf_selection_table" = tf_selection_table), path = "TF_selection_table.xlsx")
+cat("TFs selected for main figure:", sum(tf_selection_table$selected_main_figure), "\n")
+```
+
+```{r prepare_track_data}
+# Prepare the three tracks in their final form, with the correct track
+# names assigned from the start.
+
+tf_stage <- tf_selection_table %>%
+  dplyr::filter(selected_main_figure) %>%
+  dplyr::mutate(track = "Transcription Factors", label = TF) %>%
+  dplyr::select(track, label, main_stage)
+
+# Same stage-assignment rule as in Section 5 (and as the TF track,
+# Section 2.2), including reassignment of -/+ (minimum at eMPC) patterns.
+signalling_stage <- signalling_wide %>%
+  dplyr::mutate(
+    main_stage = dplyr::case_when(
+      eMPC_vs_iPSC > 0 & EC_vs_eMPC < 0 ~ "eMPC",
+      eMPC_vs_iPSC < 0 & EC_vs_eMPC > 0 & EC_vs_iPSC > 0 ~ "EC",
+      eMPC_vs_iPSC < 0 & EC_vs_eMPC > 0 & EC_vs_iPSC < 0 ~ "iPSC",
+      eMPC_vs_iPSC > 0 & EC_vs_eMPC > 0 ~ "EC",
+      eMPC_vs_iPSC < 0 & EC_vs_eMPC < 0 ~ "iPSC",
+      TRUE ~ "other"
+    ),
+    track = "Signaling / Regulatory Programs",
+    label = process
+  ) %>%
+  dplyr::select(track, label, main_stage)
+
+cellular_functions_stage <- module_scores_long %>%
+  dplyr::group_by(module, stage) %>%
+  dplyr::summarise(mean_z = mean(z_score), .groups = "drop") %>%
+  dplyr::group_by(module) %>%
+  dplyr::slice_max(mean_z, n = 1) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(track = "Cellular Functions", label = module, main_stage = stage) %>%
+  dplyr::select(track, label, main_stage)
+
+cat("TF track:", nrow(tf_stage), "| Signaling track:", nrow(signalling_stage),
+    "| Cellular Functions track:", nrow(cellular_functions_stage), "\n")
+```
+
+```{r combine_timeline_data}
+timeline_data <- dplyr::bind_rows(tf_stage, signalling_stage, cellular_functions_stage) %>%
+  dplyr::mutate(
+    track = factor(track, levels = c("Transcription Factors", "Signaling / Regulatory Programs", "Cellular Functions")),
+    main_stage = factor(main_stage, levels = c("iPSC", "eMPC", "EC"))
+  )
+
+cat("Timeline data rows:", nrow(timeline_data), "\n")
+```
+
+```{r draw_timeline, fig.width=12, fig.height=11}
+library(patchwork)
+library(ggh4x)
+
+# Cleans Hallmark (SCREAMING_SNAKE_CASE) and GO BP (lowercase) labels
+# into Title Case, with British-to-American spelling correction
+# (Signalling -> Signaling), consistent with the rest of the thesis.
+
+clean_label <- function(x) {
+  x <- gsub("_", " ", x)
+  x <- gsub("Signalling", "Signaling", x, ignore.case = TRUE)
+  tools::toTitleCase(tolower(x))
+}
+
+# Scientific-notation overrides applied after clean_label(): fixes
+# acronym capitalization (G2M, not G2m) and Greek-letter/subscript
+# notation that a generic Title Case function cannot produce correctly.
+hallmark_overrides <- c(
+  "G2m Checkpoint"          = "G2M Checkpoint",
+  "Tnfa Signaling via Nfkb" = "TNF\u03b1 Signaling via NF-\u03baB"
+)
+
+# Manual short labels for on-figure display; full names are given in
+# the figure caption.
+short_label_map <- c(
+  "Extracellular Matrix Organization / Remodelling" = "ECM Organization / Remodelling",
+  "VEGF Signaling and Endothelial Response"         = "VEGF / Endothelial Response",
+  "Cardiovascular and Endocardial Development"      = "Cardiovascular Development",
+  "Cell Adhesion and Cell-Matrix Interaction"        = "Cell-Matrix Adhesion",
+  "Vascular Homeostasis / Fluid Regulation"          = "Vascular Homeostasis",
+  "Embryonic Patterning and Morphogenesis"           = "Embryonic Patterning"
+)
+
+track_bg_colors <- c(
+  "Transcription Factors"           = "#EAF2F8",
+  "Signaling / Regulatory Programs" = "#FDF2E9",
+  "Cellular Functions"              = "#EAFAF1"
+)
+
+stage_colors <- c("iPSC" = "#4C72B0", "eMPC" = "#DD8452", "EC" = "#C44E52")
+
+# Manual panel height ratios (not proportional to item count), so
+# Cellular Functions (15 modules) does not visually dominate the
+# figure over the smaller TF and Signaling tracks.
+panel_heights <- c("Transcription Factors" = 1, "Signaling / Regulatory Programs" = 1,
+                    "Cellular Functions" = 1.4)
+
+timeline_positioned <- timeline_data %>%
+  dplyr::mutate(
+    label = dplyr::case_when(
+      track == "Signaling / Regulatory Programs" ~ dplyr::recode(clean_label(label), !!!hallmark_overrides),
+      track == "Cellular Functions"              ~ clean_label(tools::toTitleCase(label)),
+      TRUE ~ label
+    ),
+    label = dplyr::recode(label, !!!short_label_map)
+  ) %>%
+  dplyr::arrange(track, main_stage, label) %>%
+  dplyr::group_by(track, main_stage) %>%
+  dplyr::mutate(y_pos = dplyr::row_number()) %>%
+  dplyr::ungroup() %>%
+  dplyr::group_by(track) %>%
+  dplyr::mutate(y_pos = max(y_pos) - y_pos + 1,
+                stage_hex = stage_colors[as.character(main_stage)]) %>%
+  dplyr::ungroup()
+
+bg_data <- data.frame(
+  track = factor(names(track_bg_colors), levels = levels(timeline_positioned$track)),
+  fill_hex = unname(track_bg_colors)
+)
+
+main_plot <- ggplot(timeline_positioned, aes(x = main_stage, y = y_pos)) +
+  geom_rect(data = bg_data, aes(fill = I(fill_hex)),
+            xmin = -Inf, xmax = Inf, ymin = -Inf, ymax = Inf,
+            inherit.aes = FALSE) +
+  geom_vline(xintercept = 1:3, color = "gray70", linewidth = 0.3, alpha = 0.5) +
+  geom_label(aes(label = label, fill = I(stage_hex)), color = "white", fontface = "bold",
+             size = 3, linewidth = 0, label.padding = unit(0.25, "lines")) +
+  facet_grid(rows = vars(track), scales = "free_y", space = "free", switch = "y") +
+  ggh4x::force_panelsizes(rows = panel_heights[levels(timeline_positioned$track)]) +
+  scale_x_discrete(drop = FALSE, position = "top") +
+  labs(x = NULL, y = NULL, title = "Integrated Differentiation Timeline") +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    panel.grid = element_blank(),
+    strip.text.y.left = element_text(angle = 0, face = "bold", size = 10),
+    strip.placement = "outside",
+    strip.background = element_blank(),
+    panel.spacing = unit(0.6, "lines"),
+    axis.text.x.top = element_text(face = "bold", size = 12),
+    plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+    plot.margin = margin(t = 10, r = 10, b = 2, l = 10)
+  )
+
+arrow_plot <- ggplot(data.frame(x = 1, xend = 3, y = 0, yend = 0),
+                      aes(x = x, xend = xend, y = y, yend = yend)) +
+  geom_segment(arrow = arrow(length = unit(0.3, "cm"), type = "closed"),
+               linewidth = 1.2, color = "gray30") +
+  geom_segment(data = data.frame(x = 1:3, y = -0.15, yend = 0.15),
+               aes(x = x, xend = x, y = y, yend = yend),
+               inherit.aes = FALSE, color = "gray30", linewidth = 0.8) +
+  annotate("text", x = 2, y = -0.5, label = "Differentiation trajectory",
+           fontface = "italic", size = 3.5, color = "gray30") +
+  scale_x_continuous(limits = c(0.7, 3.3)) +
+  scale_y_continuous(limits = c(-0.7, 0.3)) +
+  theme_void(base_size = 12) +
+  theme(plot.margin = margin(t = 0, r = 10, b = 5, l = 10))
+
+main_plot / arrow_plot + patchwork::plot_layout(heights = c(1, 0.04))
+```

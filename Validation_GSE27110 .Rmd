@@ -1,0 +1,493 @@
+---
+title: "Validation_GSE271101"
+output:
+  pdf_document:
+        latex_engine: xelatex
+  html_document: default
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r, message=FALSE}
+# Library Import
+library(limma)
+library(edgeR)
+library(ComplexHeatmap)
+library(circlize)
+library(ggplot2)
+library(ggfortify)
+
+setwd("~/Desktop/Tese/R/Transcriptomic analysis")
+```
+
+# 1. Data Import 
+```{r import, include=FALSE}
+
+counts <- read.csv("GSE271101_raw_counts.csv.gz", row.names = 1)
+
+#Create copy to work with
+counts_gse271101 <- counts
+
+# Remove Length column
+counts_gse271101 <- counts_gse271101[, !colnames(counts_gse271101) == "Length"]
+
+# Select only the samples we need
+counts_gse271101 <- counts_gse271101[, c("IMR90_hPSC",
+                                          "mesoEPC_S1_1", "mesoEPC_S1_2", "mesoEPC_S1_3",
+                                          "mesoEPC_S2_1", "mesoEPC_S2_2", "mesoEPC_S2_3")]
+
+# Rename columns cleanly
+colnames(counts_gse271101) <- c("iPSC_1",
+                                 "EPC_1", "EPC_2", "EPC_3",
+                                 "EC_1",  "EC_2",  "EC_3")
+
+```
+
+# 2. Filtration
+## 2.1. Before Filtration
+```{r filtration, warning=FALSE}
+
+library(ggplot2)
+
+# Calculate log10 total counts per gene
+log_counts <- log10(rowSums(counts_gse271101) + 1)
+log_counts_df <- as.data.frame(log_counts)
+
+# Density plot
+ggplot(log_counts_df, aes(x = log_counts)) +
+  geom_density(fill = "steelblue", alpha = 0.5) +
+  theme_bw() +
+  xlab("Total counts per gene (log10)") +
+  ylab("Density") +
+  theme(axis.line = element_line(colour = "black"),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank()) +
+  ggtitle("Distribution of Counts - GSE271101 Before Filtration")
+```
+
+## 2.2. After Filtration
+```{r filtration_2, warning=FALSE}
+
+# Apply filtration threshold (log10 > 2.7)
+filtered_counts_gse271101 <- counts_gse271101[log10(rowSums(counts_gse271101) + 1) > 2.7, ]
+
+# Check dimensions after filtration
+dim(filtered_counts_gse271101)
+
+# Post-filtration density plot
+log_counts_filtered_gse271101 <- log10(rowSums(filtered_counts_gse271101) + 1)
+log_counts_filtered_gse271101 <- as.data.frame(log_counts_filtered_gse271101)
+
+ggplot(log_counts_filtered_gse271101, aes(x = log_counts_filtered_gse271101)) +
+  geom_density() +
+  theme_bw() +
+  ylab("Density") +
+  xlab("Normalised Counts (log10)") +
+  theme(axis.line = element_line(colour = "black"),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank()) +
+  ggtitle("Total counts per gene - GSE271101 After Filtration")
+```
+
+# 3. Voom 
+```{r voom, warning=FALSE}
+
+# Create DGEList object from filtered count table
+dgelist <- DGEList(filtered_counts_gse271101)
+
+# Calculate normalisation factors (TMM method)
+# Note: this step calculates the factors but does not normalise yet
+dgelist <- calcNormFactors(dgelist)
+
+# Define group labels for the design matrix
+# iPSC has 1 replicate; EPC and EC have 3 biological replicates each
+
+group_labels <- c(
+  "iPSC",
+  "EPC", "EPC", "EPC",
+  "EC",  "EC",  "EC"
+)
+
+# Build the design matrix
+# ~0 means no intercept - each group gets its own coefficient
+
+mm <- model.matrix(~0 + group_labels)
+
+# Apply voom normalisation
+# This converts counts to log2-CPM and estimates the
+# mean-variance relationship needed for linear modelling
+
+y_gse271101 <- voom(dgelist, mm, plot = TRUE)
+
+```
+
+# 4. PCA
+```{r PCA, warning=FALSE}
+# Prepare data matrix for PCA
+dfforpca_gse271101 <- y_gse271101$E
+dfforpca_gse271101 <- rbind(dfforpca_gse271101, group_labels)
+dfforpca_gse271101 <- t(dfforpca_gse271101)
+
+numcol_gse271101 <- c(1:(ncol(dfforpca_gse271101) - 1))
+
+# Convert to data frame and numeric columns
+dfforpca_gse271101 <- as.data.frame(dfforpca_gse271101)
+dfforpca_gse271101[, numcol_gse271101] <- apply(dfforpca_gse271101[, numcol_gse271101], 2,
+                                                  function(x) as.numeric(as.character(x)))
+
+# Specify the factor levels in trajectory order
+dfforpca_gse271101$group_labels <- factor(dfforpca_gse271101$group_labels,
+                                           levels = c("iPSC", "EPC", "EC"))
+
+# Run PCA
+pca_res_gse271101 <- prcomp(dfforpca_gse271101[, numcol_gse271101], scale = FALSE)
+
+# PCA plot
+p_gse271101 <- autoplot(
+  pca_res_gse271101,
+  data = dfforpca_gse271101,
+  x = 1,
+  y = 2,
+  colour = "group_labels",
+  size = 8,
+  alpha = 0.7
+)
+
+# Apply manual colors (one per cell type)
+p_gse271101 <- p_gse271101 + theme_bw() +
+  scale_colour_manual(
+    name = "Cell Type",
+    values = c(
+      "iPSC" = "lightblue",
+      "EPC"  = "lightsalmon",
+      "EC"   = "lightgreen"
+    )
+  ) +
+  ggtitle("PCA Plot - GSE271101") +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    axis.line = element_line(colour = "black"),
+    panel.grid.minor = element_blank(),
+    panel.border = element_blank(),
+    panel.background = element_blank()
+  )
+
+p_gse271101
+
+# Top contributing genes per PC
+contribs1_gse271101 <- pca_res_gse271101$rotation[, 1]
+contribs2_gse271101 <- pca_res_gse271101$rotation[, 2]
+contribs3_gse271101 <- pca_res_gse271101$rotation[, 3]
+
+# Biggest contributors to PC1
+(pos1genes_gse271101 <- sort(contribs1_gse271101, decreasing = TRUE)[1:10])
+(neg1genes_gse271101 <- sort(contribs1_gse271101, decreasing = FALSE)[1:10])
+
+# Biggest contributors to PC2
+(pos2genes_gse271101 <- sort(contribs2_gse271101, decreasing = TRUE)[1:10])
+(neg2genes_gse271101 <- sort(contribs2_gse271101, decreasing = FALSE)[1:10])
+
+```
+
+# 5. Heatmap
+```{r heatmap, fig.width=12, fig.height=6.5}
+
+# Define Gene Panel (full canonical panel)
+pluripotency         <- c("POU5F1", "SOX2", "KLF4", "MYC")
+mesoderm_induction   <- c("TBXT", "MIXL1", "EOMES", "ETV2", "KDR", "CD34")
+endothelial_identity <- c("PECAM1", "CDH5", "VWF", "NOS3", "SOX17", "ERG")
+
+genes_use_gse271101 <- c(pluripotency, mesoderm_induction, endothelial_identity)
+
+# Full canonical panel
+genes_all <- genes_use_gse271101
+
+# Genes present before filtration
+genes_present_prefilt <- genes_all[genes_all %in% rownames(counts_gse271101)]
+genes_absent_prefilt  <- genes_all[!genes_all %in% rownames(counts_gse271101)]
+
+# Genes present after filtration / voom
+genes_present_postfilt <- genes_all[genes_all %in% rownames(y_gse271101$E)]
+genes_removed_filter   <- setdiff(genes_present_prefilt, genes_present_postfilt)
+
+# Print summary
+cat("=== CANONICAL GENE CHECK - GSE271101 ===\n")
+cat("Present before filtration:\n", paste(genes_present_prefilt, collapse = ", "), "\n\n")
+cat("Absent before filtration:\n", paste(genes_absent_prefilt, collapse = ", "), "\n\n")
+cat("Removed after filtration:\n", paste(genes_removed_filter, collapse = ", "), "\n\n")
+cat("Used in heatmap:\n", paste(genes_present_postfilt, collapse = ", "), "\n\n")
+
+# Final genes used in heatmap
+genes_use_gse271101 <- genes_present_postfilt
+
+# Keep only genes present after filtration/normalisation
+genes_use_gse271101 <- genes_use_gse271101[genes_use_gse271101 %in% rownames(y_gse271101$E)]
+
+# Create stage mapping
+stage_map_gse271101 <- c(
+  setNames(rep("Pluripotency", length(pluripotency)), pluripotency),
+  setNames(rep("Mesoderm induction", length(mesoderm_induction)), mesoderm_induction),
+  setNames(rep("Endothelial identity", length(endothelial_identity)), endothelial_identity)
+)
+
+row_stage_gse271101 <- factor(
+  stage_map_gse271101[genes_use_gse271101],
+  levels = c("Pluripotency", "Mesoderm induction", "Endothelial identity")
+)
+
+# Subset and row-scale expression matrix
+mat <- y_gse271101$E[genes_use_gse271101, , drop = FALSE]
+mat_scaled_gse271101 <- t(scale(t(mat)))
+
+# Replace possible NA values caused by zero-variance genes
+mat_scaled_gse271101[is.na(mat_scaled_gse271101)] <- 0
+
+# Clean column names
+colnames(mat_scaled_gse271101) <- c(
+  "iPSC_1",
+  "EPC_1", "EPC_2", "EPC_3",
+  "EC_1",  "EC_2",  "EC_3"
+)
+
+# Column groups
+col_group_gse271101 <- factor(
+  c(rep("iPSC", 1), rep("EPC", 3), rep("EC", 3)),
+  levels = c("iPSC", "EPC", "EC")
+)
+
+# Heatmap colour scale
+col_fun <- colorRamp2(
+  c(-2, 0, 2),
+  c("#2166AC", "white", "#B2182B")
+)
+
+# Top annotation
+top_ha <- HeatmapAnnotation(
+  Group = anno_block(
+    gp = gpar(fill = "grey95", col = "grey70"),
+    labels = c("iPSC", "EPC", "EC"),
+    labels_gp = gpar(fontsize = 11, fontface = "bold", col = "black")
+  ),
+  show_annotation_name = FALSE,
+  height = unit(7, "mm")
+)
+
+# Left annotation
+left_ha <- rowAnnotation(
+  Stage = anno_block(
+    gp = gpar(fill = "grey95", col = "grey70"),
+    labels = c("Pluripotency", "Mesoderm induction", "Endothelial identity"),
+    labels_gp = gpar(fontsize = 10, fontface = "bold", col = "black"),
+    labels_rot = 0
+  ),
+  show_annotation_name = FALSE,
+  width = unit(37, "mm")
+)
+
+# Draw heatmap
+ht <- Heatmap(
+  mat_scaled_gse271101,
+  name = "Z-score\nexpression",
+  col = col_fun,
+  
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  
+  row_split = row_stage_gse271101,
+  column_split = col_group_gse271101,
+  
+  top_annotation = top_ha,
+  left_annotation = left_ha,
+  
+  column_title = NULL,
+  row_title = NULL,
+  
+  show_row_names = TRUE,
+  row_names_side = "right",
+  row_names_gp = gpar(fontsize = 10),
+  
+  show_column_names = TRUE,
+  column_names_rot = 90,
+  column_names_gp = gpar(fontsize = 10),
+  
+  show_row_dend = FALSE,
+  show_column_dend = FALSE,
+  
+  row_gap = unit(3, "mm"),
+  column_gap = unit(3, "mm"),
+  
+  rect_gp = gpar(col = "grey70", lwd = 0.6),
+  border = TRUE,
+  
+  heatmap_legend_param = list(
+    title = "Z-score\nexpression",
+    at = c(-2, -1, 0, 1, 2),
+    labels = c("-2", "-1", "0", "1", "2")
+  )
+)
+
+draw(
+  ht,
+  heatmap_legend_side = "right",
+  column_title = "Canonical marker expression across iPSC, EPC and EC stages - GSE271101",
+  column_title_side = "top",
+  column_title_gp = gpar(fontsize = 14, fontface = "bold"),
+  padding = unit(c(4, 2, 2, 2), "mm")
+)
+
+```
+
+# 6. Export Results 
+```{r export}
+library(writexl)
+
+# Define full canonical panel for export
+canonical_genes <- c("POU5F1", "SOX2", "KLF4", "MYC",
+                     "TBXT", "MIXL1", "EOMES", "ETV2", "KDR", "CD34",
+                     "PECAM1", "CDH5", "VWF", "NOS3", "SOX17", "ERG")
+
+# Create output directory
+dir.create("results/GSE271101", recursive = TRUE, showWarnings = FALSE)
+
+# 1. Gene availability table
+gene_availability <- data.frame(
+  gene          = canonical_genes,
+  in_dataset    = canonical_genes %in% rownames(counts_gse271101),
+  after_filter  = canonical_genes %in% rownames(y_gse271101$E),
+  status        = ifelse(
+    !canonical_genes %in% rownames(counts_gse271101), "Absent from dataset",
+    ifelse(!canonical_genes %in% rownames(y_gse271101$E), "Removed by filtration", "Used")
+  )
+)
+
+write.csv(gene_availability,
+          "results/GSE271101/gene_availability.csv",
+          row.names = FALSE)
+
+# 2. PCA plot
+pdf("results/GSE271101/pca_plot.pdf", width = 7, height = 6)
+print(p_gse271101)
+dev.off()
+
+# 3. Heatmap
+pdf("results/GSE271101/heatmap.pdf", width = 12, height = 6.5)
+draw(
+  ht,
+  heatmap_legend_side = "right",
+  column_title        = "Canonical marker expression across iPSC, EPC and EC stages - GSE271101",
+  column_title_side   = "top",
+  column_title_gp     = gpar(fontsize = 14, fontface = "bold"),
+  padding             = unit(c(4, 2, 2, 20), "mm")
+)
+dev.off()
+
+write.csv(mat_scaled_gse271101, "results/GSE271101/mat_z.csv")
+```
+
+
+# 7. Linear Models and DEG Analysis - GSE271101
+
+```{r linear_models_gse271101}
+# Note: iPSC has a single replicate, thus contrasts involving iPSC have 
+# reduced statistical power and should be interpreted with caution
+
+# Fit linear model
+fitted_gse271101 <- lmFit(y_gse271101, mm)
+
+# Define contrasts
+# EPC vs iPSC (mesoderm induction)
+contr_EPC_vs_iPSC_gse271101 <- makeContrasts(
+  group_labelsEPC - group_labelsiPSC,
+  levels = colnames(coef(fitted_gse271101)))
+
+# EC vs EPC (endothelial specification)
+contr_EC_vs_EPC_gse271101 <- makeContrasts(
+  group_labelsEC - group_labelsEPC,
+  levels = colnames(coef(fitted_gse271101)))
+
+# EC vs iPSC (full trajectory)
+contr_EC_vs_iPSC_gse271101 <- makeContrasts(
+  group_labelsEC - group_labelsiPSC,
+  levels = colnames(coef(fitted_gse271101)))
+
+# Estimate contrasts
+tmp_EPC_vs_iPSC_gse271101 <- contrasts.fit(fitted_gse271101, contr_EPC_vs_iPSC_gse271101)
+tmp_EC_vs_EPC_gse271101   <- contrasts.fit(fitted_gse271101, contr_EC_vs_EPC_gse271101)
+tmp_EC_vs_iPSC_gse271101  <- contrasts.fit(fitted_gse271101, contr_EC_vs_iPSC_gse271101)
+
+# Apply eBayes
+tmp_EPC_vs_iPSC_gse271101 <- eBayes(tmp_EPC_vs_iPSC_gse271101)
+tmp_EC_vs_EPC_gse271101   <- eBayes(tmp_EC_vs_EPC_gse271101)
+tmp_EC_vs_iPSC_gse271101  <- eBayes(tmp_EC_vs_iPSC_gse271101)
+
+# Extract full topTable for each contrast
+DEGenes_EPC_vs_iPSC_gse271101 <- topTable(tmp_EPC_vs_iPSC_gse271101, 
+                                            sort.by = "logFC", n = Inf)
+DEGenes_EPC_vs_iPSC_gse271101$GeneID <- rownames(DEGenes_EPC_vs_iPSC_gse271101)
+
+DEGenes_EC_vs_EPC_gse271101 <- topTable(tmp_EC_vs_EPC_gse271101, 
+                                          sort.by = "logFC", n = Inf)
+DEGenes_EC_vs_EPC_gse271101$GeneID <- rownames(DEGenes_EC_vs_EPC_gse271101)
+
+DEGenes_EC_vs_iPSC_gse271101 <- topTable(tmp_EC_vs_iPSC_gse271101, 
+                                           sort.by = "logFC", n = Inf)
+DEGenes_EC_vs_iPSC_gse271101$GeneID <- rownames(DEGenes_EC_vs_iPSC_gse271101)
+
+# Filter DEGs: adj.P.Val < 0.05 and |logFC| >= 1
+DEGs_EPC_vs_iPSC_gse271101 <- DEGenes_EPC_vs_iPSC_gse271101[
+  DEGenes_EPC_vs_iPSC_gse271101$adj.P.Val < 0.05 & 
+  abs(DEGenes_EPC_vs_iPSC_gse271101$logFC) >= 1, ]
+
+DEGs_EC_vs_EPC_gse271101 <- DEGenes_EC_vs_EPC_gse271101[
+  DEGenes_EC_vs_EPC_gse271101$adj.P.Val < 0.05 & 
+  abs(DEGenes_EC_vs_EPC_gse271101$logFC) >= 1, ]
+
+DEGs_EC_vs_iPSC_gse271101 <- DEGenes_EC_vs_iPSC_gse271101[
+  DEGenes_EC_vs_iPSC_gse271101$adj.P.Val < 0.05 & 
+  abs(DEGenes_EC_vs_iPSC_gse271101$logFC) >= 1, ]
+
+# Summary
+cat("=== DEG Summary - GSE271101 ===\n")
+cat("Note: contrasts involving iPSC have reduced statistical power (single replicate)\n\n")
+cat("DEGs EPC vs iPSC:", nrow(DEGs_EPC_vs_iPSC_gse271101), "\n")
+cat("DEGs EC vs EPC:",   nrow(DEGs_EC_vs_EPC_gse271101),   "\n")
+cat("DEGs EC vs iPSC:",  nrow(DEGs_EC_vs_iPSC_gse271101),  "\n")
+
+# Export topTable objects for use in cross-dataset intersection
+saveRDS(DEGenes_EPC_vs_iPSC_gse271101, "DEGenes_EPC_vs_iPSC_gse271101.rds")
+saveRDS(DEGenes_EC_vs_EPC_gse271101,   "DEGenes_EC_vs_EPC_gse271101.rds")
+saveRDS(DEGenes_EC_vs_iPSC_gse271101,  "DEGenes_EC_vs_iPSC_gse271101.rds")
+```
+
+```{r filter_degs_gse271101}
+# Filter DEGs: adj.P.Val < 0.05 and |logFC| >= 1
+DEGs_EPC_vs_iPSC_gse271101 <- DEGenes_EPC_vs_iPSC_gse271101[
+  DEGenes_EPC_vs_iPSC_gse271101$adj.P.Val < 0.05 &
+  abs(DEGenes_EPC_vs_iPSC_gse271101$logFC) >= 1, ]
+
+DEGs_EC_vs_EPC_gse271101 <- DEGenes_EC_vs_EPC_gse271101[
+  DEGenes_EC_vs_EPC_gse271101$adj.P.Val < 0.05 &
+  abs(DEGenes_EC_vs_EPC_gse271101$logFC) >= 1, ]
+
+DEGs_EC_vs_iPSC_gse271101 <- DEGenes_EC_vs_iPSC_gse271101[
+  DEGenes_EC_vs_iPSC_gse271101$adj.P.Val < 0.05 &
+  abs(DEGenes_EC_vs_iPSC_gse271101$logFC) >= 1, ]
+
+cat("=== Filtered DEGs - GSE271101 ===\n")
+cat("DEGs EPC vs iPSC:", nrow(DEGs_EPC_vs_iPSC_gse271101), "\n")
+cat("DEGs EC vs EPC:",   nrow(DEGs_EC_vs_EPC_gse271101),   "\n")
+cat("DEGs EC vs iPSC:",  nrow(DEGs_EC_vs_iPSC_gse271101),  "\n")
+```
+
+```{r export_degs_gse271101}
+# Export filtered DEGs for use in cross-dataset intersection
+saveRDS(DEGs_EPC_vs_iPSC_gse271101, "DEGs_EPC_vs_iPSC_gse271101.rds")
+saveRDS(DEGs_EC_vs_EPC_gse271101,   "DEGs_EC_vs_EPC_gse271101.rds")
+saveRDS(DEGs_EC_vs_iPSC_gse271101,  "DEGs_EC_vs_iPSC_gse271101.rds")
+```

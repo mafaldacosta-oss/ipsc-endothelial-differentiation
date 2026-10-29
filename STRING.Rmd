@@ -1,0 +1,328 @@
+---
+title: "STRING Network Analysis of Leading Edge Genes"
+output:
+  pdf_document:
+        latex_engine: xelatex
+  html_document: default
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(fig.path = "figures/", dev = c("png", "pdf"), dpi = 300)
+```
+
+```{r libraries, message=FALSE}
+
+library(readxl)     
+library(dplyr)      
+library(tidyr)      
+library(writexl)   
+library(STRINGdb)   
+library(igraph)     
+library(purrr) 
+```
+
+```{r setup_dir}
+
+setwd("~/Desktop/Tese/R/Transcriptomic analysis")
+```
+
+```{r download_settings}
+# Allow enough time to download the full STRING network (~80 MB);
+# R's default timeout (60 s) can interrupt the download.
+options(timeout = 600)
+```
+
+# 1. Load Curation File and Build Module-Level Leading-Edge Gene Sets
+
+```{r load_curation_file}
+# Load the a priori curated GO term file. Sheet names correspond to the
+# three contrasts. Column header rows differ between sheets (some sheets
+# have a "Parameters:" note row above the real header), hence the
+# different `skip` values — confirmed by inspecting each sheet directly.
+
+curation_eMPC_vs_iPSC <- read_excel(
+  "~/Desktop/Tese/R/GSEA_GO_BP_curated_apriori.xlsx", sheet = "eMPC_vs_iPSC", skip = 2)
+curation_EC_vs_eMPC   <- read_excel(
+  "~/Desktop/Tese/R/GSEA_GO_BP_curated_apriori.xlsx", sheet = "EC_vs_eMPC", skip = 0)
+curation_EC_vs_iPSC   <- read_excel(
+  "~/Desktop/Tese/R/GSEA_GO_BP_curated_apriori.xlsx", sheet = "EC_vs_iPSC", skip = 0)
+
+cat("Columns:", paste(colnames(curation_eMPC_vs_iPSC), collapse = ", "), "\n")
+```
+
+```{r extract_leading_edge}
+# Extract leading edge genes from pathways marked "yes_apriori" in the
+# a priori curation. Returns one row per (pathway, gene) pair, with
+# biological_category and contrast carried along.
+#
+# Columns are renamed by position using base R (not tidyselect helpers),
+# and all dplyr/tidyr calls are namespaced (dplyr::, tidyr::), for the
+# same reasons documented in Molecular_Signatures.Rmd.
+
+extract_leadinggene <- function(curation_df, contrast_name) {
+
+  n <- ncol(curation_df)
+  colnames(curation_df)[2] <- "include_apriori_std"
+  colnames(curation_df)[3] <- "contrast_side_std"
+  colnames(curation_df)[4] <- "biological_category_std"
+  colnames(curation_df)[n] <- "leadingEdge_std"
+
+  stopifnot(colnames(curation_df)[2] == "include_apriori_std")
+
+  selected <- curation_df[
+    !is.na(curation_df$include_apriori_std) &
+    curation_df$include_apriori_std == "yes_apriori", ]
+
+  cat(contrast_name, "— yes_apriori pathways:", nrow(selected), "\n")
+
+  result <- selected %>%
+    dplyr::select(
+      pathway              = pathway,
+      pathway_clean         = pathway_clean,
+      biological_category   = biological_category_std,
+      leadingEdge           = leadingEdge_std
+    ) %>%
+    dplyr::mutate(
+      contrast = contrast_name,
+      leadingEdge = as.character(leadingEdge)
+    ) %>%
+    tidyr::separate_rows(leadingEdge, sep = ",\\s*") %>%
+    dplyr::rename(gene = leadingEdge) %>%
+    dplyr::filter(!is.na(gene), gene != "")
+
+  return(result)
+}
+
+le_eMPC_vs_iPSC <- extract_leadinggene(curation_eMPC_vs_iPSC, "eMPC_vs_iPSC")
+le_EC_vs_eMPC   <- extract_leadinggene(curation_EC_vs_eMPC,   "EC_vs_eMPC")
+le_EC_vs_iPSC   <- extract_leadinggene(curation_EC_vs_iPSC,   "EC_vs_iPSC")
+
+le_all <- dplyr::bind_rows(le_eMPC_vs_iPSC, le_EC_vs_eMPC, le_EC_vs_iPSC)
+
+cat("\nTotal gene-pathway associations extracted:", nrow(le_all), "\n")
+```
+
+```{r build_module_gene_sets}
+# Build the analytical gene set per biological module: the full union of
+# leading-edge genes from ALL yes_apriori pathways in that module, across
+# all three contrasts. No pathway subselection is applied — this mirrors
+# the a priori curation logic itself, and avoids introducing a second,
+# subjective selection criterion after pathway curation is already closed.
+
+module_gene_sets <- le_all %>%
+  dplyr::group_by(biological_category) %>%
+  dplyr::summarise(genes = list(unique(gene)), n_genes = dplyr::n_distinct(gene),
+                    n_pathways = dplyr::n_distinct(pathway), .groups = "drop")
+
+print(module_gene_sets[, c("biological_category","n_genes","n_pathways")])
+```
+
+# 2. Map Genes to STRING and Build Analytical Networks
+
+```{r init_string_db}
+# Initialize the STRING database connection.
+# species = 9606: Homo sapiens
+# score_threshold = 700: STRING "high confidence" interactions (STRING
+#   uses a 0-1000 scale; 700 corresponds to a combined score of 0.7).
+#   This is the analytical threshold, applied uniformly to every module,
+#   fixed before results were inspected.
+# Reference: Szklarczyk et al. 2023, Nucleic Acids Research, "The STRING
+#   database in 2023: protein-protein association networks and
+#   functional enrichment analyses for any sequenced genome of interest"
+#   (STRING v12).
+
+string_db <- STRINGdb$new(version = "12", species = 9606,
+                           score_threshold = 700, input_directory = "")
+```
+
+```{r map_and_build_networks}
+# For each module, map the full gene set to STRING identifiers and
+# retrieve the analytical network (all mapped genes, no node reduction).
+# This full network is used for all reported statistics (Section 3);
+# node/edge reduction is applied only at the figure stage (Section 4).
+
+map_module <- function(genes, module_name) {
+  df <- data.frame(gene = genes, stringsAsFactors = FALSE)
+  mapped <- string_db$map(df, "gene", removeUnmappedRows = TRUE)
+  cat(module_name, "— submitted:", length(genes), "| mapped:", nrow(mapped), "\n")
+  return(mapped)
+}
+
+module_mapped <- purrr::map2(
+  module_gene_sets$genes, module_gene_sets$biological_category,
+  map_module
+)
+names(module_mapped) <- module_gene_sets$biological_category
+```
+
+# 3. Network Statistics per Module
+
+```{r network_statistics}
+# Report, for each module, the statistics of the FULL analytical network
+# (never the reduced visualization subset): submitted genes, mapped
+# genes, nodes, edges, expected edges, and PPI enrichment p-value
+# (string_db$get_ppi_enrichment tests whether the observed number of
+# edges exceeds what would be expected for a random gene set of the
+# same size, drawn from the full STRING network).
+
+get_module_stats <- function(mapped_df, submitted_n, module_name) {
+  if (nrow(mapped_df) < 2) {
+    cat(module_name, ": fewer than 2 mapped genes, skipping\n")
+    return(NULL)
+  }
+  enrichment <- string_db$get_ppi_enrichment(mapped_df$STRING_id)
+
+  data.frame(
+    module           = module_name,
+    submitted_genes  = submitted_n,
+    mapped_genes     = nrow(mapped_df),
+    nodes            = nrow(mapped_df),
+    edges            = enrichment$edges,
+    expected_edges   = enrichment$lambda,
+    ppi_enrichment_p = enrichment$enrichment
+  )
+}
+
+network_stats <- purrr::pmap_dfr(
+  list(module_mapped, module_gene_sets$n_genes, names(module_mapped)),
+  get_module_stats
+)
+
+print(network_stats)
+write_xlsx(list("network_statistics" = network_stats), path = "STRING_network_statistics.xlsx")
+```
+
+```{r hub_genes}
+# Top hub genes per module by degree (number of connections), calculated
+# from the FULL analytical network (score >= 0.7) via igraph.
+# STRINGdb::get_interactions() returns each interaction twice, so
+# duplicated interactions are removed before building the graph
+# (A-B and B-A are treated as the same interaction). Without this step,
+# all degrees were doubled (the ranking was unaffected).
+
+# Display names (American spelling, sentence case), as in the
+# Molecular Signatures figures
+module_display_names <- c(
+  "mesoderm development"                            = "Mesoderm development",
+  "embryonic patterning and morphogenesis"          = "Embryonic patterning and morphogenesis",
+  "mesenchymal development"                         = "Mesenchymal development",
+  "epithelial-mesenchymal transition"               = "Epithelial\u2013mesenchymal transition",
+  "cardiovascular and endocardial development"      = "Cardiovascular and endocardial development",
+  "developmental signalling"                        = "Developmental signaling",
+  "pluripotency / stem cell maintenance"            = "Stem cell population maintenance",
+  "endothelial specification"                       = "Endothelial specification",
+  "VEGF signaling and endothelial response"         = "VEGF signaling and endothelial response",
+  "angiogenesis / vasculogenesis"                   = "Angiogenesis / vasculogenesis",
+  "cell adhesion and cell-matrix interaction"       = "Cell adhesion and cell\u2013matrix interaction",
+  "extracellular matrix organization / remodelling" = "Extracellular matrix organization / remodeling",
+  "mechanotransduction / shear stress"              = "Mechanotransduction / shear stress",
+  "vascular homeostasis / fluid regulation"         = "Vascular homeostasis / fluid regulation",
+  "hemostasis / coagulation"                        = "Hemostasis / coagulation",
+  "immune / inflammatory response"                  = "Immune / inflammatory response"
+)
+
+# Check: every module has a display name (expect character(0))
+print(setdiff(trimws(names(module_mapped)), names(module_display_names)))
+
+# Build an undirected graph without duplicated interactions
+build_module_graph <- function(mapped_df) {
+  interactions <- string_db$get_interactions(mapped_df$STRING_id)
+  if (nrow(interactions) == 0) return(NULL)
+  interactions_unique <- interactions %>%
+    dplyr::mutate(id1 = pmin(from, to), id2 = pmax(from, to)) %>%
+    dplyr::distinct(id1, id2, .keep_all = TRUE) %>%
+    dplyr::select(from = id1, to = id2, dplyr::everything(), -dplyr::any_of(c("id1", "id2")))
+  igraph::graph_from_data_frame(interactions_unique, directed = FALSE)
+}
+
+get_hub_genes <- function(mapped_df, module_name, top_n = 10) {
+  g <- build_module_graph(mapped_df)
+  if (is.null(g)) return(NULL)
+
+  deg <- igraph::degree(g)
+  deg_df <- data.frame(STRING_id = names(deg), degree = deg) %>%
+    dplyr::left_join(mapped_df[, c("gene","STRING_id")], by = "STRING_id") %>%
+    dplyr::arrange(dplyr::desc(degree)) %>%
+    dplyr::slice_head(n = top_n) %>%
+    dplyr::mutate(module = module_name,
+                  module_display = unname(module_display_names[trimws(module_name)]))
+
+  return(deg_df[, c("module","module_display","gene","degree")])
+}
+
+# Check: number of unique interactions per module should match the
+# edges reported by get_ppi_enrichment() in network_stats (expect all TRUE)
+edges_check <- purrr::map_int(module_mapped, function(df) {
+  g <- build_module_graph(df)
+  if (is.null(g)) 0L else igraph::ecount(g)
+})
+print(data.frame(module = names(edges_check),
+                 edges_graph = edges_check,
+                 edges_stats = network_stats$edges[match(names(edges_check), network_stats$module)],
+                 match = edges_check == network_stats$edges[match(names(edges_check), network_stats$module)]))
+
+hub_genes_all <- purrr::map2_dfr(module_mapped, names(module_mapped), get_hub_genes)
+write_xlsx(list("hub_genes" = hub_genes_all), path = "STRING_hub_genes.xlsx")
+print(hub_genes_all)
+```
+
+# 4. Network Visualization
+
+```{r draw_networks, fig.width=9, fig.height=9}
+# Fixed visualization rule, defined before inspecting individual network
+# sizes: modules with <=80 mapped nodes are shown in full; modules with
+# >80 nodes are reduced to the top 25 nodes by degree. Degree is computed
+# from the FULL analytical network (score >= 0.7) without duplicated
+# interactions (build_module_graph, hub_genes chunk). Figure edges are
+# always filtered to score >= 0.9 (STRINGdb score_threshold = 900),
+# regardless of module size. This rule is applied identically to every
+# module — no module-specific adjustment based on how the figure looks.
+# Titles use the display module names (module_display_names).
+# add_summary = FALSE removes the summary text that plot_network() prints
+# by default (protein/interaction counts and p-value of the visualization
+# network), which differs from the analytical statistics reported in the text.
+
+string_db_highconf <- STRINGdb$new(version = "12", species = 9606,
+                                    score_threshold = 900, input_directory = "")
+
+draw_module_network <- function(mapped_df, module_name) {
+  if (nrow(mapped_df) < 2) return(invisible(NULL))
+
+  display_name <- unname(module_display_names[trimws(module_name)])
+
+  if (nrow(mapped_df) > 80) {
+    g <- build_module_graph(mapped_df)
+    deg <- igraph::degree(g)
+    top_ids <- names(sort(deg, decreasing = TRUE))[1:25]
+    plot_set <- mapped_df[mapped_df$STRING_id %in% top_ids, ]
+    cat(display_name, ": >80 nodes, showing top 25 by degree\n")
+  } else {
+    plot_set <- mapped_df
+    cat(display_name, ": <=80 nodes, showing full network\n")
+  }
+
+  # Increase top margin (bottom, left, top, right) to make room for the title
+  par(mar = c(1, 1, 6, 1))
+  string_db_highconf$plot_network(plot_set$STRING_id, add_summary = FALSE)
+  title(main = display_name, line = 4, cex.main = 1.3)
+}
+
+purrr::walk2(module_mapped, names(module_mapped), draw_module_network)
+```
+
+# 5. Export Mapped Gene Lists per Module
+
+```{r export_mapped_genes}
+# Export the full mapped gene list per module (STRING identifiers +
+# original gene symbols), for reference and reproducibility.
+
+mapped_export <- purrr::map2(
+  module_mapped, names(module_mapped),
+  function(df, name) dplyr::mutate(df, module = name)
+) %>% dplyr::bind_rows()
+
+write_xlsx(list("mapped_genes_by_module" = mapped_export), path = "STRING_mapped_genes.xlsx")
+cat("Exported STRING_mapped_genes.xlsx —", nrow(mapped_export), "rows\n")
+```

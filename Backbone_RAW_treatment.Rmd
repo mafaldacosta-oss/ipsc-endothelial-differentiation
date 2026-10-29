@@ -1,0 +1,865 @@
+---
+title: "Backbone Data Treatment"
+output:
+  pdf_document:
+        latex_engine: xelatex
+  html_document: default
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(fig.path = "figures/", dev = c("png", "pdf"), dpi = 300)
+```
+
+
+```{r, message=FALSE}
+# Library Import
+library(limma)
+library(edgeR)
+library(magrittr)
+library(tidyverse)
+library(ggplot2)
+library(ggpubr)
+library(data.table)
+library(ggfortify)
+library(pheatmap)
+library(biomaRt)
+library(dplyr)
+library(grid)
+
+
+setwd("~/Desktop/Tese/R/Transcriptomic analysis")
+```
+
+
+# 1. Data Import 
+```{r import, include=FALSE}
+setwd("~/Desktop/Tese/R/Transcriptomic analysis/Backbone_Raw")
+
+# Read each featureCounts tabular file individually
+iPSC_K15_WT <- read.table("iPSC_K15.tabular", header=TRUE, sep="\t", row.names=1)
+iPSC_K37_WT <- read.table("iPSC_K37.tabular", header=TRUE, sep="\t", row.names=1)
+iPSC_K53_WT <- read.table("iPSC_K53.tabular", header=TRUE, sep="\t", row.names=1)
+eMPC_K15_WT <- read.table("eMPC_K15.tabular", header=TRUE, sep="\t", row.names=1)
+eMPC_K37_WT <- read.table("eMPC_K37.tabular", header=TRUE, sep="\t", row.names=1)
+eMPC_K53_WT <- read.table("eMPC_K53.tabular", header=TRUE, sep="\t", row.names=1)
+EC_K15_WT   <- read.table("EC_K15.tabular",   header=TRUE, sep="\t", row.names=1)
+EC_K37_WT   <- read.table("EC_K37.tabular",   header=TRUE, sep="\t", row.names=1)
+EC_K53_WT   <- read.table("EC_K53.tabular",   header=TRUE, sep="\t", row.names=1)
+
+# Merge all samples into a single count matrix
+dif.read.counts <- cbind(
+  iPSC_K15_WT, iPSC_K37_WT, iPSC_K53_WT,
+  eMPC_K15_WT, eMPC_K37_WT, eMPC_K53_WT,
+  EC_K15_WT,   EC_K37_WT,   EC_K53_WT
+)
+
+# Assign sample names as column headers
+colnames(dif.read.counts) <- c(
+  "iPSC_A", "iPSC_B", "iPSC_C",
+  "eMPC_A", "eMPC_B", "eMPC_C",
+  "EC_A",   "EC_B",   "EC_C"
+)
+
+```
+
+
+# 2. Ensembl ID to HGNC Symbol Conversion
+```{r counts, include=FALSE}
+
+# Preserve original count matrix - work on a copy to avoid altering raw data
+raw_reads <- dif.read.counts
+
+# Store Ensembl IDs from row names
+genes <- rownames(raw_reads)
+
+# Retrieve HGNC symbols for all Ensembl IDs
+# The mapping is saved to a file the first time, so later knits do not depend on Ensembl
+map_file <- "~/Desktop/Tese/R/Transcriptomic analysis/ensembl_hgnc_map.rds"
+
+if (file.exists(map_file)) {
+  G_list <- readRDS(map_file)
+} else {
+  # Same BioMart query as getBM (ensembl_gene_id + hgnc_symbol, unique rows),
+  # sent as GET because POST requests from biomaRt returned HTTP 405
+  query_xml <- paste0(
+    '<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE Query>',
+    '<Query virtualSchemaName="default" formatter="TSV" header="1" uniqueRows="1">',
+    '<Dataset name="hsapiens_gene_ensembl" interface="default">',
+    '<Attribute name="ensembl_gene_id"/><Attribute name="hgnc_symbol"/>',
+    '</Dataset></Query>'
+  )
+  url <- paste0("https://www.ensembl.org/biomart/martservice?query=",
+                utils::URLencode(query_xml, reserved = TRUE))
+  res <- curl::curl_fetch_memory(url)
+  full_map <- read.delim(text = rawToChar(res$content), stringsAsFactors = FALSE)
+  colnames(full_map) <- c("ensembl_gene_id", "hgnc_symbol")
+  full_map$hgnc_symbol[is.na(full_map$hgnc_symbol)] <- ""
+
+  # Keep only the IDs present in this dataset (as getBM with a filter would return)
+  G_list <- full_map[full_map$ensembl_gene_id %in% genes, ]
+  saveRDS(G_list, map_file)
+}
+
+# Add Ensembl IDs as a column for merging
+raw_reads$ensembl_gene_id <- rownames(raw_reads)
+
+# Merge count matrix with HGNC symbols
+eltable <- merge(raw_reads, G_list, by = "ensembl_gene_id", all = TRUE)
+
+# Remove genes without a corresponding HGNC symbol
+eltable <- subset(eltable, hgnc_symbol != "" & !is.na(hgnc_symbol))
+
+# Remove Ensembl ID column
+eltable$ensembl_gene_id <- NULL
+
+# Collapse duplicate HGNC symbols by summing counts
+read.counts <- eltable %>%
+  group_by(hgnc_symbol) %>%
+  summarise(across(where(is.numeric), sum, na.rm = TRUE))
+
+read.counts <- as.data.frame(read.counts)
+
+# Set HGNC symbols as row names
+row.names(read.counts) <- read.counts$hgnc_symbol
+read.counts$hgnc_symbol <- NULL
+
+# Update main working object with HGNC-annotated counts
+dif.read.counts <- read.counts
+```
+
+# 3. Extra Quality Control
+
+Let's check for sample complexity. It is possible that one or more samples have different complexity. In specific, I am going to check if enough reads have been obtained from every sample. If not, we should have a great bias to housekeeping genes. Another way to put it, is to say that even with all reads, we won't obtain a great deal of different genes.
+
+```{r complexity, warning=FALSE, message=FALSE, results='hide'}
+
+# Create dataset with cumulative reads per sample
+cumulative_counts <- c()
+
+for (i in 1:ncol(dif.read.counts)) {
+  temporary <- dif.read.counts[order(dif.read.counts[, i], decreasing = TRUE), ]
+  database <- cumsum(temporary[, i])
+  cumulative_counts <- cbind(cumulative_counts, database)
+}
+
+cumulative_counts <- as.data.frame(cumulative_counts)
+colnames(cumulative_counts) <- paste0("Sample_", 1:ncol(cumulative_counts))
+
+# Reshape to long format
+cumulative_long <- cumulative_counts %>%
+  mutate(genes = row_number()) %>%
+  pivot_longer(cols = starts_with("Sample_"),
+               names_to = "Sample",
+               values_to = "Reads")
+
+# Plot 1 - Cumulative reads per sample (log10)
+p1 <- ggplot(cumulative_long, aes(x = genes, y = log10(Reads),
+                                   group = Sample, color = Sample)) +
+  geom_line() +
+  theme_bw() +
+  theme(
+    legend.position = "none",
+    axis.line = element_line(colour = "black"),
+    panel.grid.minor = element_blank(),
+    panel.border = element_blank(),
+    panel.background = element_blank()
+  ) +
+  xlab("Number of Genes Covered") +
+  ylab("Number of Reads (log10)") +
+  xlim(0, 16000) +
+  scale_colour_manual(name = "Sample", values = rep("red", ncol(cumulative_counts)))
+
+print(p1)
+
+# Get maximum cumulative value per sample (last gene)
+max_per_sample <- cumulative_long %>%
+  group_by(Sample) %>%
+  filter(genes == max(genes)) %>%
+  ungroup()
+
+# Calculate percentage of total reads per gene per sample
+cumulative_pct <- cumulative_long %>%
+  left_join(max_per_sample, by = "Sample", suffix = c("", "_max")) %>%
+  mutate(value = (Reads / Reads_max) * 100) %>%
+  dplyr::select(Sample, genes, value)
+
+# Plot 2 - Cumulative reads as percentage
+p2 <- ggplot(cumulative_pct, aes(x = genes, y = value,
+                                  group = Sample, color = Sample)) +
+  geom_line() +
+  theme_bw() +
+  theme(
+    legend.position = "none",
+    axis.line = element_line(colour = "black"),
+    panel.grid.minor = element_blank(),
+    panel.border = element_blank(),
+    panel.background = element_blank()
+  ) +
+  geom_hline(yintercept = 50, linetype = "dashed") +
+  xlab("Number of Genes Covered") +
+  ylab("Number of Reads (%)") +
+  scale_x_continuous(limits = c(0, max(cumulative_long$genes))) +
+  scale_colour_manual(name = "Sample", values = rep("red", ncol(cumulative_counts)))
+
+print(p2)
+
+```
+# 4. Filtration
+
+## 4.1. Before Filtration
+
+```{r filtration, warning=FALSE}
+# Calculate log10 of total reads per gene for each cell type group
+log_counts_iPSC <- log10(rowSums(dif.read.counts[, c(1,2,3)]))
+log_counts_iPSC <- as.data.frame(log_counts_iPSC)
+
+log_counts_eMPC <- log10(rowSums(dif.read.counts[, c(4,5,6)]))
+log_counts_eMPC <- as.data.frame(log_counts_eMPC)
+
+log_counts_EC <- log10(rowSums(dif.read.counts[, c(7,8,9)]))
+log_counts_EC <- as.data.frame(log_counts_EC)
+
+# Calculate log10 of total reads across all 9 samples
+log_counts_all <- log10(rowSums(dif.read.counts))
+log_counts_all <- as.data.frame(log_counts_all)
+
+# Plot density - all samples combined
+ggplot(log_counts_all, aes(x = log_counts_all)) +
+  geom_density() +
+  theme_bw() +
+  geom_vline(xintercept = 2.7, linetype = "dashed") +
+  ylab("Density") +
+  xlab("Normalised Counts (log10)") +
+  theme(axis.line = element_line(colour = "black"),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank()) +
+  ggtitle("Density of Counts - All Samples")
+
+# Plot density - iPSC
+ggplot(log_counts_iPSC, aes(x = log_counts_iPSC)) +
+  geom_density(fill = "steelblue", alpha = 0.5) +
+  theme_bw() +
+  geom_vline(xintercept = 2.6, linetype = "dashed") +
+  ylab("Density") +
+  xlab("Normalised Counts (log10)") +
+  theme(axis.line = element_line(colour = "black"),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank()) +
+  ggtitle("Density of Counts - iPSC (Day 0)")
+
+# Plot density - eMPC
+ggplot(log_counts_eMPC, aes(x = log_counts_eMPC)) +
+  geom_density(fill = "darkorange", alpha = 0.5) +
+  theme_bw() +
+  geom_vline(xintercept = 2.6, linetype = "dashed") +
+  ylab("Density") +
+  xlab("Normalised Counts (log10)") +
+  theme(axis.line = element_line(colour = "black"),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank()) +
+  ggtitle("Density of Counts - eMPC (Day 3)")
+
+# Plot density - EC
+ggplot(log_counts_EC, aes(x = log_counts_EC)) +
+  geom_density(fill = "seagreen", alpha = 0.5) +
+  theme_bw() +
+  geom_vline(xintercept = 2.6, linetype = "dashed") +
+  ylab("Density") +
+  xlab("Normalised Counts (log10)") +
+  theme(axis.line = element_line(colour = "black"),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank()) +
+  ggtitle("Density of Counts - EC (Day 11)")
+
+# Faceted density plot per sample
+dffordensy <- dif.read.counts
+
+sample_labels <- c(
+  "iPSC_A", "iPSC_B", "iPSC_C",
+  "eMPC_A", "eMPC_B", "eMPC_C",
+  "EC_A",   "EC_B",   "EC_C"
+)
+
+sample_colors <- c(
+  "EC_A"   = "steelblue",
+  "EC_B"   = "steelblue",
+  "EC_C"   = "steelblue",
+  "eMPC_A" = "darkorange",
+  "eMPC_B" = "darkorange",
+  "eMPC_C" = "darkorange",
+  "iPSC_A" = "seagreen",
+  "iPSC_B" = "seagreen",
+  "iPSC_C" = "seagreen"
+)
+
+dffordensy_long <- dffordensy %>%
+  t() %>%
+  as.data.frame() %>%
+  mutate(Sample = sample_labels) %>%
+  pivot_longer(cols = -Sample,
+               names_to = "Feature",
+               values_to = "Expression")
+
+density_plot <- ggplot(dffordensy_long,
+                       aes(x = log10(Expression), group = Sample, fill = Sample)) +
+  geom_density(alpha = 0.5) +
+  facet_wrap(. ~ Sample, ncol = 3) +
+  scale_fill_manual(name = "Sample", values = sample_colors) +
+  theme_bw() +
+  xlab("Normalised Counts (log10)") +
+  ylab("Density") +
+  theme(legend.position = "none",
+        strip.text.x = element_text(size = 12),
+        strip.background = element_rect(color = "black",
+                                        fill = "#FFFFFF",
+                                        linewidth = 1,
+                                        linetype = "solid")) +
+  geom_vline(xintercept = 2.2, linetype = "dashed")
+
+density_plot
+
+```
+## 4.2. After Filtration
+
+```{r filtration 2}
+# Apply filter - keep genes with log10 total reads > 2.7 across all samples
+filtered_counts <- subset(dif.read.counts, log_counts_all > 2.7)
+
+# Visualise distribution after filtration
+log_counts_filtered <- log10(rowSums(filtered_counts))
+log_counts_filtered <- as.data.frame(log_counts_filtered)
+
+ggplot(log_counts_filtered, aes(x = log_counts_filtered)) +
+  geom_density() +
+  theme_bw() +
+  ylab("Density") +
+  xlab("Normalised Counts (log10)") +
+  theme(axis.line = element_line(colour = "black"),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank()) +
+  ggtitle("Distribution of Normalised Counts - After Filtration")
+
+# Save retained gene names
+retained_genes <- row.names(log_counts_filtered)
+
+# Select only retained genes from the main count table
+counts_filtered <- dif.read.counts[row.names(dif.read.counts) %in% retained_genes, ]
+```
+# 3. Matrices
+
+Desig of our matrices. 
+
+```{r matrixes and normalization}
+
+# Create DGEList object from filtered count table
+dgelist <- DGEList(counts_filtered)
+
+# Calculate normalisation factors (TMM method)
+# Note: this step calculates the factors but does not normalise yet
+dgelist <- calcNormFactors(dgelist)
+
+# Define group labels for the design matrix
+# Each cell type has 3 biological replicates
+group_labels <- c(
+  "iPSC", "iPSC", "iPSC",
+  "eMPC", "eMPC", "eMPC",
+  "EC",   "EC",   "EC"
+)
+
+# Build the design matrix
+# ~0 means no intercept - each group gets its own coefficient
+mm <- model.matrix(~0 + group_labels)
+
+# Apply voom normalisation
+# This converts counts to log2-CPM and estimates the
+# mean-variance relationship needed for linear modelling
+y <- voom(dgelist, mm, plot = FALSE)
+
+saveRDS(y, "y_voom_backbone.rds")
+
+# Extract normalised expression matrix
+normalised_counts <- y$E
+
+# Save normalised results to file
+write.table(normalised_counts, 
+            "~/Desktop/Tese/R/Transcriptomic analysis/normalised_counts.txt", 
+            row.names = TRUE, 
+            col.names = TRUE)
+```
+# 4. Normalization
+
+Convert read counts to log2-CPM to visualise normalisation quality. Check if medians are at similar level and few outliers.
+
+```{r normalization}
+
+library(ggplot2)
+library(data.table)
+library(ggpubr)
+
+# Convert filtered counts to data.table for plotting
+dfforboxy <- as.data.table(counts_filtered, keep.rownames = FALSE)
+orderforplots <- sample_labels
+
+# Create a sample type/color mapping
+colouring <- data.table(Sample = colnames(dfforboxy), Types = orderforplots)
+
+# Melt the data.table
+dfforboxy_melt <- melt(dfforboxy, variable.name = "Sample", value.name = "Expression")
+dfforboxy_melt <- merge(dfforboxy_melt, colouring, by = "Sample")
+
+# Define a named color vector to ensure correct mapping
+color_map <- c(
+  "iPSC_A" = "lightblue",
+  "iPSC_B" = "lightblue",
+  "iPSC_C" = "lightblue",
+  "eMPC_A" = "lightsalmon",
+  "eMPC_B" = "lightsalmon",
+  "eMPC_C" = "lightsalmon",
+  "EC_A"   = "lightgreen",
+  "EC_B"   = "lightgreen",
+  "EC_C"   = "lightgreen"
+)
+
+# Pre-normalisation boxplot
+prenorm <- ggplot(dfforboxy_melt, aes(x = Sample, y = log2(Expression + 1), fill = Types)) +
+  geom_boxplot(alpha = 0.6) +
+  theme_bw() +
+  ylab("Normalised Counts (log2)") +
+  xlab("Samples") +
+  scale_fill_manual(name = "Cell Type", values = color_map) +
+  theme(
+    axis.line = element_line(colour = "black"),
+    panel.grid.minor = element_blank(),
+    panel.border = element_blank(),
+    panel.background = element_blank(),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    legend.position = "none"
+  ) +
+  ggtitle("Prior to Voom Normalisation")
+
+# Post-normalisation boxplot
+dfforboxy_post <- as.data.table(y$E)
+dfforboxy_post_melt <- melt(dfforboxy_post, variable.name = "Sample", value.name = "Expression")
+dfforboxy_post_melt <- merge(dfforboxy_post_melt, colouring, by = "Sample")
+
+postnorm <- ggplot(dfforboxy_post_melt, aes(x = Sample, y = Expression, fill = Types)) +
+  geom_boxplot(alpha = 0.6) +
+  theme_bw() +
+  ylab("Normalised Counts (log2CPM)") +
+  xlab("Samples") +
+  scale_fill_manual(name = "Cell Type", values = color_map) +
+  theme(
+    axis.line = element_line(colour = "black"),
+    panel.grid.minor = element_blank(),
+    panel.border = element_blank(),
+    panel.background = element_blank(),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    legend.position = "none"
+  ) +
+  ggtitle("After Voom Normalisation")
+
+# Arrange side by side
+ggarrange(prenorm, postnorm, nrow = 1)
+
+```
+# 5. PCA
+
+PCA clusters replicates and reveals the differentiation trajectory.
+
+```{r PCA}
+
+# Prepare data matrix for PCA
+dfforpca <- y$E
+dfforpca <- rbind(dfforpca, sample_labels)
+dfforpca <- t(dfforpca)
+
+numcol <- c(1:(ncol(dfforpca)-1))
+
+# Convert to data frame and numeric columns
+dfforpca <- as.data.frame(dfforpca)
+dfforpca[, numcol] <- apply(dfforpca[, numcol], 2,
+                             function(x) as.numeric(as.character(x)))
+
+# Specify the factor levels in trajectory order
+dfforpca$sample_labels <- factor(dfforpca$sample_labels, levels = unique(sample_labels))
+
+# Run PCA
+pca_res <- prcomp(dfforpca[, numcol], scale = FALSE)
+
+# Create a new column with just the cell type (strip _A, _B, _C)
+dfforpca$timepoint <- sub("_(A|B|C)$", "", dfforpca$sample_labels)
+
+# PCA plot
+p <- autoplot(
+  pca_res,
+  data = dfforpca,
+  x = 1,
+  y = 2,
+  colour = "timepoint",
+  size = 8,
+  alpha = 0.7
+)
+
+# Apply manual colors (one per cell type)
+p <- p + theme_bw() +
+  scale_colour_manual(
+    name = "Cell Type",
+    values = c(
+      "iPSC" = "lightblue",
+      "eMPC" = "lightsalmon",
+      "EC"   = "lightgreen"
+    )
+  ) +
+  ggtitle("PCA Plot") +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    axis.line = element_line(colour = "black"),
+    panel.grid.minor = element_blank(),
+    panel.border = element_blank(),
+    panel.background = element_blank()
+  )
+
+p
+
+# Top contributing genes per PC
+contribs1 <- pca_res$rotation[, 1]
+contribs2 <- pca_res$rotation[, 2]
+contribs3 <- pca_res$rotation[, 3]
+
+# Biggest contributors to PC1 
+(pos1genes <- sort(contribs1, decreasing = TRUE)[1:10])
+(neg1genes <- sort(contribs1, decreasing = FALSE)[1:10])
+
+# Biggest contributors to PC2 
+(pos2genes <- sort(contribs2, decreasing = TRUE)[1:10])
+(neg2genes <- sort(contribs2, decreasing = FALSE)[1:10])
+
+# Biggest contributors to PC3
+(pos3genes <- sort(contribs3, decreasing = TRUE)[1:10])
+(neg3genes <- sort(contribs3, decreasing = FALSE)[1:10])
+
+# Export to Excel
+PC1_results <- data.frame(
+  Rank = 1:100,
+  PC1_Positive = names(sort(contribs1, decreasing = TRUE)[1:100]),
+  PC1_Negative = names(sort(contribs1, decreasing = FALSE)[1:100])
+)
+
+
+PC2_results <- data.frame(
+  Rank = 1:100,
+  PC2_Positive = names(sort(contribs2, decreasing = TRUE)[1:100]),
+  PC2_Negative = names(sort(contribs2, decreasing = FALSE)[1:100])
+)
+
+
+library(writexl)
+write_xlsx(list(
+  PC1 = PC1_results,
+  PC2 = PC2_results),
+  path = "~/Desktop/Tese/R/Transcriptomic analysis/PCA_top100_genes.xlsx")
+```
+# 6. Linear Models
+
+Fit linear models to identify differentially expressed genes between each step of the differentiation trajectory.
+
+```{r Linear Models}
+
+# Redefine group labels without replicate letters for model fitting
+group_labels <- c(
+  "iPSC", "iPSC", "iPSC",
+  "eMPC", "eMPC", "eMPC",
+  "EC",   "EC",   "EC"
+)
+
+# Build design matrix
+mm <- model.matrix(~0 + group_labels)
+
+# Apply voom normalization with group-level design matrix
+y <- voom(dgelist, mm, plot = FALSE)
+
+# Fit linear model
+fitted <- lmFit(y, mm)
+head(coef(fitted))
+
+# Define step-to-step contrasts:
+
+# iPSC -> eMPC (Day 0 to Day 3)
+contr_iPSC_eMPC <- makeContrasts(
+  group_labelseMPC - group_labelsiPSC,
+  levels = colnames(coef(fitted)))
+
+# eMPC -> EC (Day 3 to Day 11)
+contr_eMPC_EC <- makeContrasts(
+  group_labelsEC - group_labelseMPC,
+  levels = colnames(coef(fitted)))
+
+# iPSC -> EC (Day 0 to Day 11)
+contr_iPSC_EC <- makeContrasts(
+  group_labelsEC - group_labelsiPSC,
+  levels = colnames(coef(fitted)))
+
+# Estimate contrasts for each gene
+tmp_iPSC_eMPC <- contrasts.fit(fitted, contr_iPSC_eMPC)
+tmp_eMPC_EC   <- contrasts.fit(fitted, contr_eMPC_EC)
+tmp_iPSC_EC   <- contrasts.fit(fitted, contr_iPSC_EC)
+
+# Apply empirical Bayes smoothing of standard errors (shrinks extreme standard errors):
+
+# iPSC vs eMPC (Day 0 -> Day 3)
+tmp_iPSC_eMPC <- eBayes(tmp_iPSC_eMPC)
+top.table_iPSC_eMPC <- topTable(tmp_iPSC_eMPC, sort.by = "logFC", n = Inf)
+DEGenes_iPSC_eMPC <- top.table_iPSC_eMPC
+DEGenes_iPSC_eMPC$GeneID <- row.names(DEGenes_iPSC_eMPC)
+
+# eMPC vs EC (Day 3 -> Day 11)
+tmp_eMPC_EC <- eBayes(tmp_eMPC_EC)
+top.table_eMPC_EC <- topTable(tmp_eMPC_EC, sort.by = "logFC", n = Inf)
+DEGenes_eMPC_EC <- top.table_eMPC_EC
+DEGenes_eMPC_EC$GeneID <- row.names(DEGenes_eMPC_EC)
+
+# iPSC vs EC (Day 0 -> Day 11)
+tmp_iPSC_EC <- eBayes(tmp_iPSC_EC)
+top.table_iPSC_EC <- topTable(tmp_iPSC_EC, sort.by = "logFC", n = Inf)
+DEGenes_iPSC_EC <- top.table_iPSC_EC
+DEGenes_iPSC_EC$GeneID <- row.names(DEGenes_iPSC_EC)
+```
+# 7. Gene Panel
+
+This section visualises the expression of a panel of canonical markers across the three differentiation stages (iPSC, eMPC, EC), using voom-normalised counts from the filtered dataset.
+
+## 7.1. Canonical Marker Gene Check
+
+Prior to panel construction, we verified which canonical markers from the theoretical database were detectable in the dataset, both before and after low-expression filtering.
+
+```{r gene_validation}
+
+# Define canonical marker genes from the theoretical database
+markers_iPSC <- c("POU5F1", "SOX2", "KLF4", "MYC")
+
+markers_eMPC <- c("TBXT", "MIXL1", "EOMES", "ETV2", 
+                  "CD34", "KDR", "BMP4", "INHBA", "FGF2", "VEGFA")
+
+markers_EC <- c("SOX17", "ERG", "NR2F2", "PECAM1", 
+                "CDH5", "EFNB2", "EPHB4", "CXCR4", "VWF", "NOS3", "ASS1")
+
+all_markers <- unique(c(markers_iPSC, markers_eMPC, markers_EC))
+
+# Check presence in pre-filtration count matrix
+present_prefilt <- all_markers[all_markers %in% rownames(dif.read.counts)]
+absent_prefilt  <- all_markers[!all_markers %in% rownames(dif.read.counts)]
+
+cat("=== PRE-FILTRATION ===\n")
+cat("Present:", paste(present_prefilt, collapse = ", "), "\n")
+cat("Absent: ", paste(absent_prefilt,  collapse = ", "), "\n")
+
+# Check presence in post-filtration count matrix
+present_postfilt <- all_markers[all_markers %in% rownames(counts_filtered)]
+absent_postfilt  <- all_markers[!all_markers %in% rownames(counts_filtered)]
+
+cat("\n=== POST-FILTRATION ===\n")
+cat("Present:", paste(present_postfilt, collapse = ", "), "\n")
+cat("Absent: ", paste(absent_postfilt,  collapse = ", "), "\n")
+```
+# 8. Gene Panel Heatmap
+
+Canonical markers across iPSC-to-EC differentiation using voom-normalised counts (y$E) from backbone pipeline.
+
+```{r gene_panel, fig.width=12, fig.height=6.5}
+
+library(ComplexHeatmap)
+library(circlize)
+library(grid)
+
+# Define Gene Panel
+#pluripotency         <- c("SOX2", "MYC")
+#mesoderm_induction   <- c("TBXT", "MIXL1", "KDR", "ETV2")
+#endothelial_identity <- c("CDH5", "VWF", "NOS3", "SOX17", "ERG")
+
+# Define Gene Panel (full canonical panel)
+pluripotency         <- c("POU5F1", "SOX2", "KLF4", "MYC")
+mesoderm_induction   <- c("TBXT", "MIXL1", "EOMES", "ETV2", "KDR", "CD34")
+endothelial_identity <- c("PECAM1", "CDH5", "VWF", "NOS3", "SOX17", "ERG")
+
+genes_use_backbone <- c(pluripotency, mesoderm_induction, endothelial_identity)
+
+# Keep only genes present after filtration/normalisation
+genes_use_backbone <- genes_use_backbone[genes_use_backbone %in% rownames(y$E)]
+
+# Create stage mapping
+stage_map_backbone <- c(
+  setNames(rep("Pluripotency", length(pluripotency)), pluripotency),
+  setNames(rep("Mesoderm induction", length(mesoderm_induction)), mesoderm_induction),
+  setNames(rep("Endothelial identity", length(endothelial_identity)), endothelial_identity)
+)
+
+row_stage_backbone <- factor(
+  stage_map_backbone[genes_use_backbone],
+  levels = c("Pluripotency", "Mesoderm induction", "Endothelial identity")
+)
+
+# Subset and row-scale expression matrix
+mat <- y$E[genes_use_backbone, , drop = FALSE]
+mat_scaled_backbone <- t(scale(t(mat)))
+
+# Replace possible NA values caused by zero-variance genes
+mat_scaled_backbone[is.na(mat_scaled_backbone)] <- 0
+
+# Clean column names
+colnames(mat_scaled_backbone) <- c(
+  "iPSC_1", "iPSC_2", "iPSC_3",
+  "eMPC_1", "eMPC_2", "eMPC_3",
+  "EC_1",   "EC_2",   "EC_3"
+)
+
+# Column groups
+col_group_backbone <- factor(
+  c(rep("iPSC", 3), rep("eMPC", 3), rep("EC", 3)),
+  levels = c("iPSC", "eMPC", "EC")
+)
+
+# Heatmap colour scale
+col_fun <- colorRamp2(
+  c(-2, 0, 2),
+  c("#2166AC", "white", "#B2182B")
+)
+
+# Top annotation: group names above each column block
+top_ha <- HeatmapAnnotation(
+  Group = anno_block(
+    gp = gpar(fill = "grey95", col = "grey70"),
+    labels = c("iPSC", "eMPC", "EC"),
+    labels_gp = gpar(fontsize = 11, fontface = "bold", col = "black")
+  ),
+  show_annotation_name = FALSE,
+  height = unit(7, "mm")
+)
+
+# Left annotation: stage names next to each row block
+left_ha <- rowAnnotation(
+  Stage = anno_block(
+    gp = gpar(fill = "grey95", col = "grey70"),
+    labels = c("Pluripotency", "Mesoderm induction", "Endothelial identity"),
+    labels_gp = gpar(fontsize = 10, fontface = "bold", col = "black"),
+    labels_rot = 0
+  ),
+  show_annotation_name = FALSE,
+  width = unit(37, "mm")
+)
+
+# Draw heatmap
+ht <- Heatmap(
+  mat_scaled_backbone,
+  name = "Z-score\nexpression",
+  col = col_fun,
+  
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  
+  row_split = row_stage_backbone,
+  column_split = col_group_backbone,
+  
+  top_annotation = top_ha,
+  left_annotation = left_ha,
+  
+  column_title = NULL,
+  row_title = NULL,
+  
+  show_row_names = TRUE,
+  row_names_side = "right",
+  row_names_gp = gpar(fontsize = 10),
+  
+  show_column_names = TRUE,
+  column_names_rot = 90,
+  column_names_gp = gpar(fontsize = 10),
+  
+  show_row_dend = FALSE,
+  show_column_dend = FALSE,
+  
+  row_gap = unit(3, "mm"),
+  column_gap = unit(3, "mm"),
+  
+  rect_gp = gpar(col = "grey70", lwd = 0.6),
+  border = TRUE,
+  
+  heatmap_legend_param = list(
+    title = "Z-score\nexpression",
+    at = c(-2, -1, 0, 1, 2),
+    labels = c("-2", "-1", "0", "1", "2")
+  )
+)
+
+draw(
+  ht,
+  heatmap_legend_side = "right",
+  column_title = "Canonical marker expression across iPSC, eMPC and EC stages",
+  column_title_side = "top",
+  column_title_gp = gpar(fontsize = 14, fontface = "bold"),
+  padding = unit(c(4, 2, 2, 2), "mm")
+)
+
+```
+# 8. Export Results 
+```{r export}
+library(writexl)
+
+# Define full canonical panel for export
+canonical_genes <- c("POU5F1", "SOX2", "KLF4", "MYC",
+                     "TBXT", "MIXL1", "EOMES", "ETV2", "KDR", "CD34",
+                     "PECAM1", "CDH5", "VWF", "NOS3", "SOX17", "ERG")
+
+
+# Create output directory
+dir.create("results/Backbone", recursive = TRUE, showWarnings = FALSE)
+
+# 1. Gene availability table
+gene_availability <- data.frame(
+  gene          = canonical_genes,
+  in_dataset    = canonical_genes %in% rownames(dif.read.counts),
+  after_filter  = canonical_genes %in% rownames(y$E),
+  status        = ifelse(
+    !canonical_genes %in% rownames(dif.read.counts), "Absent from dataset",
+    ifelse(!canonical_genes %in% rownames(y$E), "Removed by filtration", "Used")
+  )
+)
+
+write.csv(gene_availability,
+          "results/Backbone/gene_availability.csv",
+          row.names = FALSE)
+
+# 2. PCA plot
+pdf("results/Backbone/pca_plot.pdf", width = 7, height = 6)
+print(p)
+dev.off()
+
+# 3. Heatmap
+pdf("results/Backbone/heatmap.pdf", width = 12, height = 6.5)
+draw(
+  ht,
+  heatmap_legend_side = "right",
+  column_title        = "Canonical marker expression across iPSC, eMPC and EC stages - Backbone",
+  column_title_side   = "top",
+  column_title_gp     = gpar(fontsize = 14, fontface = "bold"),
+  padding             = unit(c(4, 2, 2, 20), "mm")
+)
+dev.off()
+
+write.csv(mat_scaled_backbone, "results/Backbone/mat_z.csv")
+
+# Export objects required by downstream DEG analysis
+saveRDS(DEGenes_iPSC_eMPC, 
+        "DEGenes_iPSC_eMPC_backbone.rds")
+saveRDS(DEGenes_eMPC_EC,   
+        "DEGenes_eMPC_EC_backbone.rds")
+saveRDS(DEGenes_iPSC_EC,   
+        "DEGenes_iPSC_EC_backbone.rds")
+```

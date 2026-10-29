@@ -1,0 +1,320 @@
+---
+title: "Validation_GSE263058"
+output:
+  pdf_document:
+        latex_engine: xelatex
+  html_document: default
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, message=FALSE}
+# Library Import
+library(dplyr)
+library(biomaRt)
+library(ggplot2)
+library(ggfortify)
+library(ComplexHeatmap)
+library(circlize)
+library(grid)
+
+setwd("~/Desktop/Tese/R/Transcriptomic analysis")
+```
+
+
+# 1. Data Import
+
+```{r import, message=FALSE}
+
+# Data import
+fpkm <- read.table("GSE263058_FPKM.all.txt.gz",
+                   header = TRUE, sep = "\t")
+
+
+# Create working copy
+fpkm_gse263058 <- fpkm
+
+# Set gene_name as rownames
+rownames(fpkm_gse263058) <- fpkm_gse263058$gene_name
+fpkm_gse263058 <- fpkm_gse263058[, -1]
+
+# Select only iPSC and 2D-iEC samples
+fpkm_gse263058 <- fpkm_gse263058[, c("hiPS.BJ273.rep1", "hiPS.BJ273.rep2", "hiPS.BJ273.rep3",
+                                      "iETV2.iEC.rep1",  "iETV2.iEC.rep2",  "iETV2.iEC.rep3")]
+
+# Rename columns
+colnames(fpkm_gse263058) <- c("iPSC_1", "iPSC_2", "iPSC_3",
+                               "iEC_1",  "iEC_2",  "iEC_3")
+
+# Confirm
+dim(fpkm_gse263058)
+head(fpkm_gse263058[, 1:4])
+```
+
+# 2. Filtration
+
+```{r filtration}
+
+# Define group labels
+group_labels_gse263058 <- c("iPSC", "iPSC", "iPSC",
+                             "iEC",  "iEC",  "iEC")
+
+# Define metadata
+metadata_gse263058 <- data.frame(
+  sample = colnames(fpkm_gse263058),
+  group  = group_labels_gse263058
+)
+
+# Require FPKM > 1 in at least 50% of samples within at least one group
+min_present <- function(n) ceiling(n * 0.5)
+
+groups <- unique(metadata_gse263058$group)
+
+keep_by_group <- lapply(groups, function(g) {
+  cols_g <- metadata_gse263058$sample[metadata_gse263058$group == g]
+  n_g    <- length(cols_g)
+  rowSums(fpkm_gse263058[, cols_g, drop = FALSE] > 1) >= min_present(n_g)
+})
+
+keep          <- Reduce(`|`, keep_by_group)
+fpkm_filtered <- fpkm_gse263058[keep, ]
+
+dim(fpkm_filtered)
+
+```
+# 3. Transformation
+
+```{r Transformation}
+
+# LOG2 TRANSFORMATION
+expr_log_gse263058 <- log2(fpkm_filtered + 1)
+
+# CANONICAL MARKER CHECK
+pluripotency         <- c("POU5F1", "SOX2", "KLF4", "MYC")
+mesoderm_induction   <- c("TBXT", "MIXL1", "EOMES", "ETV2", "KDR", "CD34")
+endothelial_identity <- c("PECAM1", "CDH5", "VWF", "NOS3", "SOX17", "ERG")
+
+canonical_genes <- c(pluripotency, mesoderm_induction, endothelial_identity)
+
+# Genes absent from dataset entirely
+genes_not_in_data <- canonical_genes[!canonical_genes %in% rownames(fpkm_gse263058)]
+
+# Genes removed by filtration
+genes_filtered_out <- canonical_genes[canonical_genes %in% rownames(fpkm_gse263058) &
+                                      !canonical_genes %in% rownames(expr_log_gse263058)]
+
+# Genes available for analysis
+genes_use_gse263058 <- canonical_genes[canonical_genes %in% rownames(expr_log_gse263058)]
+
+cat("=== CANONICAL MARKER CHECK ===\n")
+cat("Used in analysis:      ", paste(genes_use_gse263058,          collapse = ", "), "\n")
+cat("Absent from dataset:   ", paste(genes_not_in_data,  collapse = ", "), "\n")
+cat("Removed by filtration: ", paste(genes_filtered_out, collapse = ", "), "\n")
+```
+
+# 4. PCA 
+```{r PCA}
+
+# Prepare data matrix for PCA
+dfforpca_gse263058 <- t(expr_log_gse263058)
+dfforpca_gse263058 <- as.data.frame(dfforpca_gse263058)
+dfforpca_gse263058$group_labels <- group_labels_gse263058
+
+# Specify factor levels in trajectory order
+dfforpca_gse263058$group_labels <- factor(dfforpca_gse263058$group_labels,
+                                           levels = c("iPSC", "iEC"))
+
+# Run PCA
+numcol_gse263058  <- 1:(ncol(dfforpca_gse263058) - 1)
+pca_res_gse263058 <- prcomp(dfforpca_gse263058[, numcol_gse263058], scale = FALSE)
+
+# PCA plot
+p_gse263058 <- autoplot(
+  pca_res_gse263058,
+  data   = dfforpca_gse263058,
+  x      = 1,
+  y      = 2,
+  colour = "group_labels",
+  size   = 8,
+  alpha  = 0.7
+) +
+  theme_bw() +
+  scale_colour_manual(
+    name   = "Cell Type",
+    values = c("iPSC" = "lightblue",
+               "iEC"  = "lightgreen")
+  ) +
+  ggtitle("PCA Plot - GSE263058") +
+  theme(
+    plot.title       = element_text(hjust = 0.5),
+    axis.line        = element_line(colour = "black"),
+    panel.grid.minor = element_blank(),
+    panel.border     = element_blank(),
+    panel.background = element_blank()
+  )
+
+p_gse263058
+
+# Top contributing genes per PC
+contribs1_gse263058 <- pca_res_gse263058$rotation[, 1]
+contribs2_gse263058 <- pca_res_gse263058$rotation[, 2]
+
+(pos1genes_gse263058 <- sort(contribs1_gse263058, decreasing = TRUE)[1:10])
+(neg1genes_gse263058 <- sort(contribs1_gse263058, decreasing = FALSE)[1:10])
+(pos2genes_gse263058 <- sort(contribs2_gse263058, decreasing = TRUE)[1:10])
+(neg2genes_gse263058 <- sort(contribs2_gse263058, decreasing = FALSE)[1:10])
+
+```
+
+# 5. Heatmap
+
+```{r heatmap, fig.width=12, fig.height=6.5}
+
+# Create stage mapping
+stage_map_gse263058 <- c(
+  setNames(rep("Pluripotency",         length(pluripotency)),         pluripotency),
+  setNames(rep("Mesoderm induction",   length(mesoderm_induction)),   mesoderm_induction),
+  setNames(rep("Endothelial identity", length(endothelial_identity)), endothelial_identity)
+)
+
+row_stage_gse263058 <- factor(
+  stage_map_gse263058[genes_use_gse263058],
+  levels = c("Pluripotency", "Mesoderm induction", "Endothelial identity")
+)
+
+# Subset and row-scale expression matrix
+mat   <- as.matrix(expr_log_gse263058[genes_use_gse263058, , drop = FALSE])
+mat_z_gse263058 <- t(scale(t(mat)))
+mat_z_gse263058[is.na(mat_z_gse263058)] <- 0
+
+# Column groups
+col_group_gse263058 <- factor(
+  c(rep("iPSC", 3), rep("iEC", 3)),
+  levels = c("iPSC", "iEC")
+)
+
+# Heatmap colour scale
+col_fun <- colorRamp2(
+  c(-2, 0, 2),
+  c("#2166AC", "white", "#B2182B")
+)
+
+# Top annotation
+top_ha <- HeatmapAnnotation(
+  Group = anno_block(
+    gp        = gpar(fill = "grey95", col = "grey70"),
+    labels    = c("iPSC", "iEC"),
+    labels_gp = gpar(fontsize = 11, fontface = "bold", col = "black")
+  ),
+  show_annotation_name = FALSE,
+  height = unit(7, "mm")
+)
+
+# Left annotation
+left_ha <- rowAnnotation(
+  Stage = anno_block(
+    gp         = gpar(fill = "grey95", col = "grey70"),
+    labels     = c("Pluripotency", "Mesoderm induction", "Endothelial identity"),
+    labels_gp  = gpar(fontsize = 10, fontface = "bold", col = "black"),
+    labels_rot = 0
+  ),
+  show_annotation_name = FALSE,
+  width = unit(37, "mm")
+)
+
+# Draw heatmap
+ht <- Heatmap(
+  mat_z_gse263058,
+  name = "Z-score\nexpression",
+  col  = col_fun,
+
+  cluster_rows    = FALSE,
+  cluster_columns = FALSE,
+
+  row_split    = row_stage_gse263058,
+  column_split = col_group_gse263058,
+
+  top_annotation  = top_ha,
+  left_annotation = left_ha,
+
+  column_title = NULL,
+  row_title    = NULL,
+
+  show_row_names    = TRUE,
+  row_names_side    = "right",
+  row_names_gp      = gpar(fontsize = 10),
+
+  show_column_names = TRUE,
+  column_names_rot  = 90,
+  column_names_gp   = gpar(fontsize = 10),
+
+  show_row_dend    = FALSE,
+  show_column_dend = FALSE,
+
+  row_gap    = unit(3, "mm"),
+  column_gap = unit(3, "mm"),
+
+  rect_gp = gpar(col = "grey70", lwd = 0.6),
+  border  = TRUE,
+
+  heatmap_legend_param = list(
+    title  = "Z-score\nexpression",
+    at     = c(-2, -1, 0, 1, 2),
+    labels = c("-2", "-1", "0", "1", "2")
+  )
+)
+
+draw(
+  ht,
+  heatmap_legend_side = "right",
+  column_title        = "Canonical marker expression across iPSC and iEC stages - GSE263058",
+  column_title_side   = "top",
+  column_title_gp     = gpar(fontsize = 14, fontface = "bold"),
+  padding             = unit(c(4, 2, 2, 20), "mm")
+)
+```
+# 6. Export
+```{r export}
+library(writexl)
+
+# Create output directory
+dir.create("results/GSE263058", recursive = TRUE, showWarnings = FALSE)
+
+# 1. Gene availability table
+gene_availability <- data.frame(
+  gene          = canonical_genes,
+  in_dataset    = canonical_genes %in% rownames(fpkm_gse263058),
+  after_filter  = canonical_genes %in% rownames(expr_log_gse263058),
+  status        = ifelse(
+    !canonical_genes %in% rownames(fpkm_gse263058), "Absent from dataset",
+    ifelse(!canonical_genes %in% rownames(expr_log_gse263058), "Removed by filtration", "Used")
+  )
+)
+
+write.csv(gene_availability,
+          "results/GSE263058/gene_availability.csv",
+          row.names = FALSE)
+
+# 2. PCA plot
+pdf("results/GSE263058/pca_plot.pdf", width = 7, height = 6)
+print(p_gse263058)
+dev.off()
+
+# 3. Heatmap
+pdf("results/GSE263058/heatmap.pdf", width = 12, height = 6.5)
+draw(
+  ht,
+  heatmap_legend_side = "right",
+  column_title        = "Canonical marker expression across iPSC and iEC stages - GSE263058",
+  column_title_side   = "top",
+  column_title_gp     = gpar(fontsize = 14, fontface = "bold"),
+  padding             = unit(c(4, 2, 2, 20), "mm")
+)
+dev.off()
+
+write.csv(mat_z_gse263058, "results/GSE263058/mat_z.csv")
+```
+

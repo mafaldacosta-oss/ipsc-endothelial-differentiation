@@ -1,0 +1,849 @@
+---
+title: "Validation Summary"
+output:
+  pdf_document:
+        latex_engine: xelatex
+  html_document: default
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(fig.path = "figures/", dev = c("png", "pdf"), dpi = 300)
+```
+
+```{r, message=FALSE}
+
+# Library Import
+library(ComplexHeatmap)
+library(circlize)
+library(grid)
+library(ggplot2)
+library(ggfortify)
+library(dplyr)
+
+setwd("~/Desktop/Tese/R/Transcriptomic analysis")
+```
+
+# 1. Data Summary Table
+
+```{r import, message=FALSE}
+
+dataset_summary <- data.frame(
+  Dataset = c("GSE214306 (Backbone)",
+              "GSE271101",
+              "GSE271456 / GSE280017",
+              "GSE263058"),
+  Reference = c("[39]", "[46]", "[16]", "[45]"),
+  Role = c("Primary differentiation dataset",
+           "External validation of progenitor-to-EC transition",
+           "Endpoint validation",
+           "ETV2-based endpoint validation"),
+  Input = c("Raw counts", "Raw counts", "RSEM TPM", "FPKM"),
+  Stages = c("iPSC → eMPC → EC",
+             "iPSC → meso EPC → meso EC",
+             "Day 0 iPSC → Day 6 EC (normoxia)",
+             "hiPSC → Dox-ETV2 2D-iEC"),
+  Processing = c(
+    "Manual filtering; TMM + voom",
+    "Manual filtering; TMM + voom",
+    "Gene-level TPM; expression filtering; log2(TPM + 1)",
+    "Expression filtering; log2(FPKM + 1)"
+  ),
+  Analyses = c(
+    "PCA, canonical marker heatmap, differential expression, GO/GSEA",
+    "PCA, canonical marker heatmap",
+    "PCA, canonical marker heatmap",
+    "PCA, canonical marker heatmap"
+  ),
+  Markers_retained = c("12/16", "10/16", "13/16", "16/16"),
+  Main_utility = c(
+    "Main dataset for studying the iPSC-to-eMPC-to-EC differentiation trajectory",
+    "Validates endothelial commitment and EPC/EC marker patterns in an independent hPSC-to-EC protocol",
+    "Validates loss of pluripotency and acquisition of endothelial identity at the EC endpoint",
+    "Validates endothelial identity using an alternative 2D ETV2-induced iEC system"
+  ),
+  Main_limitation = c(
+    "Some canonical markers were absent or removed after filtering",
+    "The iPSC group has only one selected sample, limiting formal DE involving iPSC",
+    "No intermediate progenitor/eMPC stage",
+    "Not a natural/staged equivalent of the backbone protocol"
+  )
+)
+
+knitr::kable(dataset_summary,
+             caption = "Summary of datasets used for canonical marker validation")
+
+```
+# 2. Canonical Marker Availability Table
+
+```{r canonical_markers, message=FALSE}
+
+gene_availability <- data.frame(
+  Gene  = c("POU5F1", "SOX2", "KLF4", "MYC",
+            "TBXT", "MIXL1", "EOMES", "ETV2", "KDR", "CD34",
+            "PECAM1", "CDH5", "VWF", "NOS3", "SOX17", "ERG"),
+  Stage = c(rep("Pluripotency", 4),
+            rep("Mesoderm induction", 6),
+            rep("Endothelial identity", 6)),
+  Backbone = c("Removed", "Used", "Removed", "Used",
+               "Used", "Used", "Removed", "Used", "Used", "Used",
+               "Absent", "Used", "Used", "Used", "Used", "Used"),
+  GSE271101 = c("Removed", "Used", "Removed", "Used",
+                "Absent", "Removed", "Removed", "Removed", "Used", "Used",
+                "Used", "Used", "Used", "Used", "Used", "Used"),
+  GSE271456_GSE280017 = c("Used", "Used", "Used", "Used",
+                           "Removed", "Used", "Removed", "Used", "Used", "Used",
+                           "Absent", "Used", "Used", "Used", "Used", "Used"),
+  GSE263058 = c("Used", "Used", "Used", "Used",
+                "Used", "Used", "Used", "Used", "Used", "Used",
+                "Used", "Used", "Used", "Used", "Used", "Used")
+)
+
+knitr::kable(gene_availability,
+             caption = "Canonical marker availability across datasets",
+             col.names = c("Gene", "Stage",
+                           "GSE214306 (Backbone)",
+                           "GSE271101",
+                           "GSE271456/GSE280017",
+                           "GSE263058"))
+
+```
+# 3. Concordance UpSet Plot — Canonical Marker Availability Across Datasets
+
+```{r concordance_upset, fig.width=9, fig.height=5}
+
+# Build a binary presence matrix from the existing gene_availability table:
+# 1 = marker retained ("Used") in that dataset's analysis, 0 = not
+# ("Removed" by filtration or "Absent" from the dataset entirely — both
+# treated the same way here, since what matters for concordance is
+# whether the marker could be assessed, not why it couldn't).
+
+availability_binary <- gene_availability %>%
+  dplyr::mutate(
+    Backbone             = as.integer(Backbone == "Used"),
+    GSE271101            = as.integer(GSE271101 == "Used"),
+    GSE271456_GSE280017  = as.integer(GSE271456_GSE280017 == "Used"),
+    GSE263058            = as.integer(GSE263058 == "Used")
+  )
+
+# Matrix for ComplexHeatmap's UpSet: rows = genes, columns = datasets
+upset_mat <- as.matrix(availability_binary[, c("Backbone", "GSE271101",
+                                                 "GSE271456_GSE280017", "GSE263058")])
+rownames(upset_mat) <- availability_binary$Gene
+colnames(upset_mat) <- c("Backbone", "GSE271101", "GSE271456/GSE280017", "GSE263058")
+
+comb_mat <- make_comb_mat(upset_mat)
+
+UpSet(
+  comb_mat,
+  comb_order = order(-comb_size(comb_mat)),
+  top_annotation = upset_top_annotation(
+    comb_mat,
+    add_numbers = TRUE,
+    axis_param = list(gp = gpar(fontsize = 9))
+  ),
+  right_annotation = upset_right_annotation(
+    comb_mat,
+    add_numbers = TRUE,
+    axis_param = list(gp = gpar(fontsize = 9))
+  ),
+  row_names_gp = gpar(fontsize = 9),
+  column_title = "Overlap of retained canonical markers across datasets"
+)
+
+cat("Markers present in all 4 datasets:", comb_size(comb_mat)[names(comb_size(comb_mat)) == "1111"], "\n")
+```
+# 4. Import Expression Matrices 
+
+```{r matrices, message=FALSE}
+
+mat_backbone  <- as.matrix(read.csv("results/Backbone/mat_z.csv",
+                                     row.names = 1))
+mat_gse271101 <- as.matrix(read.csv("results/GSE271101/mat_z.csv",
+                                     row.names = 1))
+mat_gse271456 <- as.matrix(read.csv("results/GSE271456_GSE280017/mat_z.csv",
+                                     row.names = 1))
+mat_gse263058 <- as.matrix(read.csv("results/GSE263058/mat_z.csv",
+                                     row.names = 1))
+
+# Confirm dimensions and rownames
+dim(mat_backbone)
+dim(mat_gse271101)
+dim(mat_gse271456)
+dim(mat_gse263058)
+
+rownames(mat_backbone)
+rownames(mat_gse271101)
+rownames(mat_gse271456)
+rownames(mat_gse263058)
+```
+
+# 5. Comparative Heatmap
+
+```{r heatmap, fig.width=12, fig.height=10}
+
+library(ComplexHeatmap)
+library(circlize)
+library(grid)
+library(gridExtra)
+
+# Colour scale
+col_fun <- colorRamp2(
+  c(-2, 0, 2),
+  c("#2166AC", "white", "#B2182B")
+)
+
+# Stage mapping function
+make_row_stage <- function(genes) {
+  pluripotency         <- c("POU5F1", "SOX2", "KLF4", "MYC")
+  mesoderm_induction   <- c("TBXT", "MIXL1", "EOMES", "ETV2", "KDR", "CD34")
+  endothelial_identity <- c("PECAM1", "CDH5", "VWF", "NOS3", "SOX17", "ERG")
+  
+  stage_map <- c(
+    setNames(rep("Pluripotency",         length(pluripotency)),         pluripotency),
+    setNames(rep("Mesoderm induction",   length(mesoderm_induction)),   mesoderm_induction),
+    setNames(rep("Endothelial identity", length(endothelial_identity)), endothelial_identity)
+  )
+  
+  factor(stage_map[genes],
+         levels = c("Pluripotency", "Mesoderm induction", "Endothelial identity"))
+}
+
+# Fixed cell dimensions
+cell_w <- unit(6, "mm")
+cell_h <- unit(6, "mm")
+
+# Backbone
+col_group_backbone <- factor(
+  c(rep("iPSC", 3), rep("eMPC", 3), rep("EC", 3)),
+  levels = c("iPSC", "eMPC", "EC")
+)
+
+ht_backbone <- Heatmap(
+  mat_backbone,
+  name              = "Z-score_backbone",
+  col               = col_fun,
+  cluster_rows      = FALSE,
+  cluster_columns   = FALSE,
+  row_split         = make_row_stage(rownames(mat_backbone)),
+  column_split      = col_group_backbone,
+  show_row_names    = TRUE,
+  row_names_side    = "right",
+  row_names_gp      = gpar(fontsize = 9),
+  show_column_names = TRUE,
+  column_names_rot  = 90,
+  column_names_gp   = gpar(fontsize = 8),
+  column_title      = "GSE214306 (Backbone)",
+  column_title_gp   = gpar(fontsize = 10, fontface = "bold"),
+  row_title         = NULL,
+  row_gap           = unit(2, "mm"),
+  column_gap        = unit(2, "mm"),
+  rect_gp           = gpar(col = "grey70", lwd = 0.5),
+  border            = TRUE,
+  show_heatmap_legend = FALSE,
+  width             = cell_w * ncol(mat_backbone),
+  height            = cell_h * nrow(mat_backbone)
+)
+
+# GSE271101
+col_group_gse271101 <- factor(
+  c(rep("iPSC", 1), rep("EPC", 3), rep("EC", 3)),
+  levels = c("iPSC", "EPC", "EC")
+)
+
+ht_gse271101 <- Heatmap(
+  mat_gse271101,
+  name              = "Z-score_gse271101",
+  col               = col_fun,
+  cluster_rows      = FALSE,
+  cluster_columns   = FALSE,
+  row_split         = make_row_stage(rownames(mat_gse271101)),
+  column_split      = col_group_gse271101,
+  show_row_names    = TRUE,
+  row_names_side    = "right",
+  row_names_gp      = gpar(fontsize = 9),
+  show_column_names = TRUE,
+  column_names_rot  = 90,
+  column_names_gp   = gpar(fontsize = 8),
+  column_title      = "GSE271101",
+  column_title_gp   = gpar(fontsize = 10, fontface = "bold"),
+  row_title         = NULL,
+  row_gap           = unit(2, "mm"),
+  column_gap        = unit(2, "mm"),
+  rect_gp           = gpar(col = "grey70", lwd = 0.5),
+  border            = TRUE,
+  show_heatmap_legend = FALSE,
+  width             = cell_w * ncol(mat_gse271101),
+  height            = cell_h * nrow(mat_gse271101)
+)
+
+# GSE271456/GSE280017
+col_group_gse271456 <- factor(
+  c(rep("iPSC", 10), rep("EC", 10)),
+  levels = c("iPSC", "EC")
+)
+
+ht_gse271456 <- Heatmap(
+  mat_gse271456,
+  name              = "Z-score_gse271456",
+  col               = col_fun,
+  cluster_rows      = FALSE,
+  cluster_columns   = FALSE,
+  row_split         = make_row_stage(rownames(mat_gse271456)),
+  column_split      = col_group_gse271456,
+  show_row_names    = TRUE,
+  row_names_side    = "right",
+  row_names_gp      = gpar(fontsize = 9),
+  show_column_names = TRUE,
+  column_names_rot  = 90,
+  column_names_gp   = gpar(fontsize = 8),
+  column_title      = "GSE271456/GSE280017",
+  column_title_gp   = gpar(fontsize = 10, fontface = "bold"),
+  row_title         = NULL,
+  row_gap           = unit(2, "mm"),
+  column_gap        = unit(2, "mm"),
+  rect_gp           = gpar(col = "grey70", lwd = 0.5),
+  border            = TRUE,
+  show_heatmap_legend = FALSE,
+  width             = cell_w * ncol(mat_gse271456),
+  height            = cell_h * nrow(mat_gse271456)
+)
+
+# GSE263058
+col_group_gse263058 <- factor(
+  c(rep("iPSC", 3), rep("iEC", 3)),
+  levels = c("iPSC", "iEC")
+)
+
+ht_gse263058 <- Heatmap(
+  mat_gse263058,
+  name              = "Z-score\nexpression",
+  col               = col_fun,
+  cluster_rows      = FALSE,
+  cluster_columns   = FALSE,
+  row_split         = make_row_stage(rownames(mat_gse263058)),
+  column_split      = col_group_gse263058,
+  show_row_names    = TRUE,
+  row_names_side    = "right",
+  row_names_gp      = gpar(fontsize = 9),
+  show_column_names = TRUE,
+  column_names_rot  = 90,
+  column_names_gp   = gpar(fontsize = 8),
+  column_title      = "GSE263058",
+  column_title_gp   = gpar(fontsize = 10, fontface = "bold"),
+  row_title         = NULL,
+  row_gap           = unit(2, "mm"),
+  column_gap        = unit(2, "mm"),
+  rect_gp           = gpar(col = "grey70", lwd = 0.5),
+  border            = TRUE,
+  show_heatmap_legend = TRUE,
+  width             = cell_w * ncol(mat_gse263058),
+  height            = cell_h * nrow(mat_gse263058)
+)
+
+# Draw combined figure
+g1 <- grid.grabExpr(draw(ht_backbone,
+                          heatmap_legend_side = "right",
+                          padding = unit(c(2, 2, 2, 2), "mm")))
+
+g2 <- grid.grabExpr(draw(ht_gse271101,
+                          heatmap_legend_side = "right",
+                          padding = unit(c(2, 2, 2, 2), "mm")))
+
+g3 <- grid.grabExpr(draw(ht_gse271456,
+                          heatmap_legend_side = "right",
+                          padding = unit(c(2, 2, 2, 2), "mm")))
+
+g4 <- grid.grabExpr(draw(ht_gse263058,
+                          heatmap_legend_side = "right",
+                          padding = unit(c(2, 2, 2, 2), "mm")))
+
+grid.arrange(g1, g2, g3, g4,
+             ncol = 2,
+             widths  = c(1, 1),
+             heights = c(1, 1.3),
+             padding = unit(0, "mm"))
+
+# Export comparative heatmap
+pdf("results/comparative_heatmap.pdf", width = 12, height = 12)
+grid.arrange(g1, g2, g3, g4,
+             ncol    = 2,
+             widths  = c(1, 1),
+             heights = c(1, 1.3),
+             padding = unit(0, "mm"))
+dev.off()
+```
+
+
+# 5.1 Comparative Heatmap - Fixed 16-gene panel
+
+```{r heatmap_fixed_panel, fig.width=13, fig.height=12}
+
+library(ComplexHeatmap)
+library(circlize)
+library(grid)
+library(gridExtra)
+
+# Full canonical panel, in fixed biological order
+canonical_genes <- c(
+  "POU5F1", "SOX2", "KLF4", "MYC",
+  "TBXT", "MIXL1", "EOMES", "ETV2", "KDR", "CD34",
+  "PECAM1", "CDH5", "VWF", "NOS3", "SOX17", "ERG"
+)
+
+# Biological category for each row
+canonical_stage <- factor(
+  c(
+    rep("Pluripotency", 4),
+    rep("Mesoderm / progenitor", 6),
+    rep("Endothelial identity", 6)
+  ),
+  levels = c(
+    "Pluripotency",
+    "Mesoderm / progenitor",
+    "Endothelial identity"
+  )
+)
+
+# Function to expand each dataset to the complete 16-gene panel
+# Genes not available in a dataset are represented as NA
+expand_marker_matrix <- function(mat, genes = canonical_genes) {
+
+  out <- matrix(
+    NA_real_,
+    nrow = length(genes),
+    ncol = ncol(mat),
+    dimnames = list(genes, colnames(mat))
+  )
+
+  common <- intersect(genes, rownames(mat))
+  out[common, ] <- mat[common, , drop = FALSE]
+
+  out
+}
+
+# Expand all datasets to the same 16-gene panel
+mat_backbone_full  <- expand_marker_matrix(mat_backbone)
+mat_gse271101_full <- expand_marker_matrix(mat_gse271101)
+mat_gse271456_full <- expand_marker_matrix(mat_gse271456)
+mat_gse263058_full <- expand_marker_matrix(mat_gse263058)
+
+# Replace sample names by replicate numbers only
+colnames(mat_backbone_full) <- c(
+  "1", "2", "3",
+  "1", "2", "3",
+  "1", "2", "3"
+)
+
+colnames(mat_gse271101_full) <- c(
+  "1",
+  "1", "2", "3",
+  "1", "2", "3"
+)
+
+colnames(mat_gse271456_full) <- c(
+  as.character(1:10),
+  as.character(1:10)
+)
+
+colnames(mat_gse263058_full) <- c(
+  "1", "2", "3",
+  "1", "2", "3"
+)
+
+# Colour scale
+col_fun <- colorRamp2(
+  c(-2, 0, 2),
+  c("#2166AC", "white", "#B2182B")
+)
+
+# Fixed cell dimensions
+cell_w <- unit(6, "mm")
+cell_h <- unit(6, "mm")
+
+# Extra legend for unavailable markers
+lgd_not_retained <- Legend(
+  labels = "Not retained",
+  legend_gp = gpar(
+    fill = "grey85",
+    col = "grey70"
+  ),
+  title = NULL
+)
+
+# Helper function
+make_fixed_heatmap <- function(
+  mat,
+  column_groups,
+  title,
+  legend = FALSE,
+  show_group_titles = TRUE
+) {
+
+  # Stage labels above each column block
+  top_ha <- HeatmapAnnotation(
+    Stage = anno_block(
+      gp = gpar(fill = "white", col = NA),
+      labels = levels(column_groups),
+      labels_gp = gpar(
+        fontsize = 9,
+        fontface = "bold"
+      )
+    ),
+    show_annotation_name = FALSE,
+    height = unit(6, "mm")
+  )
+
+  Heatmap(
+    mat,
+    name                = "z-score\nexpression",
+    col                 = col_fun,
+    na_col              = "grey85",
+
+    cluster_rows        = FALSE,
+    cluster_columns     = FALSE,
+
+    row_split           = canonical_stage,
+    column_split        = column_groups,
+
+    top_annotation      = top_ha,
+
+    show_row_names      = TRUE,
+    row_names_side      = "right",
+    row_names_gp        = gpar(fontsize = 9),
+
+    show_column_names   = TRUE,
+    column_names_rot    = 0,
+    column_names_gp     = gpar(fontsize = 8),
+
+    column_title        = title,
+    column_title_gp     = gpar(
+      fontsize = 10,
+      fontface = "bold"
+    ),
+
+    row_title           = if (show_group_titles) levels(canonical_stage) else NULL,
+    row_title_gp        = gpar(
+      fontsize = 8,
+      fontface = "bold"
+    ),
+    row_title_rot       = 90,
+
+    row_gap             = unit(2, "mm"),
+    column_gap          = unit(2, "mm"),
+
+    rect_gp             = gpar(
+      col = "grey70",
+      lwd = 0.5
+    ),
+
+    border              = TRUE,
+    show_heatmap_legend = legend,
+
+    width               = cell_w * ncol(mat),
+    height              = cell_h * nrow(mat)
+  )
+}
+
+# Column groups
+col_group_backbone <- factor(
+  c(
+    rep("iPSC", 3),
+    rep("eMPC", 3),
+    rep("EC", 3)
+  ),
+  levels = c("iPSC", "eMPC", "EC")
+)
+
+col_group_gse271101 <- factor(
+  c(
+    rep("iPSC", 1),
+    rep("EPC", 3),
+    rep("EC", 3)
+  ),
+  levels = c("iPSC", "EPC", "EC")
+)
+
+col_group_gse271456 <- factor(
+  c(
+    rep("iPSC", 10),
+    rep("EC", 10)
+  ),
+  levels = c("iPSC", "EC")
+)
+
+col_group_gse263058 <- factor(
+  c(
+    rep("iPSC", 3),
+    rep("iEC", 3)
+  ),
+  levels = c("iPSC", "iEC")
+)
+
+# Build heatmaps
+ht_backbone_full <- make_fixed_heatmap(
+  mat_backbone_full,
+  col_group_backbone,
+  "GSE214306 (Backbone)",
+  show_group_titles = TRUE
+)
+
+ht_gse271101_full <- make_fixed_heatmap(
+  mat_gse271101_full,
+  col_group_gse271101,
+  "GSE271101",
+  show_group_titles = FALSE
+)
+
+ht_gse271456_full <- make_fixed_heatmap(
+  mat_gse271456_full,
+  col_group_gse271456,
+  "GSE271456/GSE280017",
+  show_group_titles = TRUE
+)
+
+ht_gse263058_full <- make_fixed_heatmap(
+  mat_gse263058_full,
+  col_group_gse263058,
+  "GSE263058",
+  legend = TRUE,
+  show_group_titles = FALSE
+)
+
+# Convert to grobs
+g1_fixed <- grid.grabExpr(
+  draw(
+    ht_backbone_full,
+    heatmap_legend_side = "right",
+    padding = unit(c(2, 2, 2, 2), "mm")
+  )
+)
+
+g2_fixed <- grid.grabExpr(
+  draw(
+    ht_gse271101_full,
+    heatmap_legend_side = "right",
+    padding = unit(c(2, 2, 2, 2), "mm")
+  )
+)
+
+g3_fixed <- grid.grabExpr(
+  draw(
+    ht_gse271456_full,
+    heatmap_legend_side = "right",
+    padding = unit(c(2, 2, 2, 18), "mm")
+  )
+)
+
+g4_fixed <- grid.grabExpr(
+  draw(
+    ht_gse263058_full,
+    heatmap_legend_side = "right",
+    heatmap_legend_list = list(lgd_not_retained),
+    padding = unit(c(2, 30, 2, 2), "mm")
+  )
+)
+
+# Display
+grid.arrange(
+  g1_fixed, g2_fixed,
+  g3_fixed, g4_fixed,
+  ncol = 2,
+  widths = c(1, 1),
+  heights = c(1, 1.3),
+  padding = unit(0, "mm")
+)
+
+# Export
+pdf(
+  "results/comparative_heatmap_fixed_panel.pdf",
+  width = 13,
+  height = 12
+)
+
+grid.arrange(
+  g1_fixed, g2_fixed,
+  g3_fixed, g4_fixed,
+  ncol = 2,
+  widths = c(1, 1),
+  heights = c(1, 1.3),
+  padding = unit(0, "mm")
+)
+
+dev.off()
+```
+
+# 6. Expression Profiles
+
+```{r expression_profiles, message=FALSE,  fig.width=12, fig.height=8}
+
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+# STEP 1: Calculate mean z-score per stage per gene per dataset
+
+# Helper function
+mean_by_stage <- function(mat, stage_assignments) {
+  stages <- unique(stage_assignments)
+  result <- sapply(stages, function(s) {
+    cols <- names(stage_assignments[stage_assignments == s])
+    if (length(cols) == 1) mat[, cols]
+    else rowMeans(mat[, cols, drop = FALSE])
+  })
+  as.data.frame(result)
+}
+
+# Stage assignments
+stages_backbone <- c(
+  iPSC_1 = "iPSC", iPSC_2 = "iPSC", iPSC_3 = "iPSC",
+  eMPC_1 = "Progenitor-like", eMPC_2 = "Progenitor-like", eMPC_3 = "Progenitor-like",
+  EC_1   = "EC",  EC_2   = "EC",  EC_3   = "EC"
+)
+
+stages_gse271101 <- c(
+  iPSC_1 = "iPSC",
+  EPC_1  = "Progenitor-like", EPC_2 = "Progenitor-like", EPC_3 = "Progenitor-like",
+  EC_1   = "EC",  EC_2  = "EC",  EC_3  = "EC"
+)
+
+stages_gse271456 <- c(
+  setNames(rep("iPSC", 10), paste0("iPSC_", 1:10)),
+  setNames(rep("EC",   10), paste0("EC_",   1:10))
+)
+
+stages_gse263058 <- c(
+  iPSC_1 = "iPSC", iPSC_2 = "iPSC", iPSC_3 = "iPSC",
+  iEC_1  = "EC",   iEC_2  = "EC",   iEC_3  = "EC"
+)
+
+# Calculate means
+means_backbone  <- mean_by_stage(mat_backbone,  stages_backbone)
+means_gse271101 <- mean_by_stage(mat_gse271101, stages_gse271101)
+means_gse271456 <- mean_by_stage(mat_gse271456, stages_gse271456)
+means_gse263058 <- mean_by_stage(mat_gse263058, stages_gse263058)
+
+# STEP 2: Build long data frame
+to_long <- function(means_df, dataset_name) {
+  means_df$gene    <- rownames(means_df)
+  means_df$dataset <- dataset_name
+  pivot_longer(means_df,
+               cols      = -c(gene, dataset),
+               names_to  = "stage",
+               values_to = "mean_z")
+}
+
+df_long <- bind_rows(
+  to_long(means_backbone,  "GSE214306 (Backbone)"),
+  to_long(means_gse271101, "GSE271101"),
+  to_long(means_gse271456, "GSE271456/GSE280017"),
+  to_long(means_gse263058, "GSE263058")
+)
+
+# Set stage order
+df_long$stage <- factor(df_long$stage,
+                         levels = c("iPSC", "Progenitor-like", "EC"))
+
+# Dataset colours
+dataset_colours <- c(
+  "GSE214306 (Backbone)" = "#1b7837",
+  "GSE271101"            = "#762a83",
+  "GSE271456/GSE280017"  = "#d6604d",
+  "GSE263058"            = "#4393c3"
+)
+
+# Dataset linetypes: solid for 3-stage, dashed for 2-stage
+dataset_linetypes <- c(
+  "GSE214306 (Backbone)" = "solid",
+  "GSE271101"            = "solid",
+  "GSE271456/GSE280017"  = "dashed",
+  "GSE263058"            = "dashed"
+)
+
+# STEP 3: Full figure - all markers
+p_all <- ggplot(df_long, aes(x        = stage,
+                              y        = mean_z,
+                              colour   = dataset,
+                              linetype = dataset,
+                              group    = dataset)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 2.5) +
+  facet_wrap(~ gene, scales = "free_y", ncol = 4) +
+  scale_colour_manual(name   = "Dataset", values = dataset_colours) +
+  scale_linetype_manual(name = "Dataset", values = dataset_linetypes) +
+  scale_x_discrete(drop = FALSE) +
+  theme_bw() +
+  theme(
+    axis.text.x      = element_text(angle = 45, hjust = 1, size = 8),
+    axis.text.y      = element_text(size = 8),
+    strip.text       = element_text(face = "bold", size = 9),
+    legend.position  = "bottom",
+    panel.grid.minor = element_blank()
+  ) +
+  labs(x     = "Differentiation stage",
+       y     = "Mean row-wise z-score expression",
+       title = "Expression profiles of canonical markers across datasets")
+
+p_all
+
+# STEP 4: Three separate figures by marker group
+genes_pluripotency <- c("POU5F1", "SOX2", "KLF4", "MYC")
+genes_mesoderm     <- c("TBXT", "MIXL1", "EOMES", "ETV2", "KDR", "CD34")
+genes_endothelial  <- c("PECAM1", "CDH5", "VWF", "NOS3", "SOX17", "ERG")
+
+plot_group <- function(genes_subset, title_label, ncol_facet = 3) {
+  df_subset      <- df_long[df_long$gene %in% genes_subset, ]
+  df_subset$gene <- factor(df_subset$gene, levels = genes_subset)
+
+  ggplot(df_subset, aes(x        = stage,
+                         y        = mean_z,
+                         colour   = dataset,
+                         linetype = dataset,
+                         group    = dataset)) +
+    geom_line(linewidth = 0.8) +
+    geom_point(size = 2.5) +
+    facet_wrap(~ gene, scales = "free_y", ncol = ncol_facet) +
+    scale_colour_manual(name   = "Dataset", values = dataset_colours) +
+    scale_linetype_manual(name = "Dataset", values = dataset_linetypes) +
+    scale_x_discrete(drop = FALSE) +
+    scale_y_continuous(n.breaks = 3) +
+        theme_bw(base_size = 15) +
+    theme(
+      axis.text.x      = element_text(angle = 45, hjust = 1, size = 14),
+      axis.text.y      = element_text(size = 14),
+      strip.text       = element_text(face = "bold", size = 15),
+      legend.position  = "bottom",
+      panel.grid.minor = element_blank()
+    ) +
+    labs(x     = "Differentiation stage",
+         y     = "Mean z-score",
+         title = title_label)
+}
+
+p_pluripotency <- plot_group(genes_pluripotency,
+                              "Expression profiles — Pluripotency markers",
+                              ncol_facet = 2)
+
+p_mesoderm     <- plot_group(genes_mesoderm,
+                              "Expression profiles — Mesoderm / progenitor markers",
+                              ncol_facet = 3)
+
+p_endothelial  <- plot_group(genes_endothelial,
+                              "Expression profiles — Endothelial identity markers",
+                              ncol_facet = 3)
+
+p_pluripotency
+p_mesoderm
+p_endothelial
+
+# Export expression profiles
+ggsave("results/expression_profiles_pluripotency.pdf",
+       plot = p_pluripotency, width = 12, height = 8)
+
+ggsave("results/expression_profiles_mesoderm.pdf",
+       plot = p_mesoderm, width = 12, height = 8)
+
+ggsave("results/expression_profiles_endothelial.pdf",
+       plot = p_endothelial, width = 12, height = 8)
+```
