@@ -16,8 +16,8 @@ The main differentiation trajectory uses GSE214306 as the backbone dataset, with
 
 - Backbone_RAW_treatment.Rmd: Backbone count processing, identifier mapping, filtering, normalisation, PCA, marker visualisation and differential expression.
 
-- Validation_GSE27110 .Rmd: GSE271101 count processing, marker assessment and differential expression. The original filename contains a space before ".Rmd"; the dataset accession is GSE271101.
-
+- Validation_GSE271101.Rmd: GSE271101 count processing, marker assessment and differential expression.
+  
 - Validation_GSE263058.Rmd: GSE263058 FPKM processing and marker assessment.
 
 - Validation_GSE271456_GSE280017.Rmd: Combined RSEM-derived expression processing and marker assessment.
@@ -38,7 +38,7 @@ The main differentiation trajectory uses GSE214306 as the backbone dataset, with
 
 ## Execution order
 
-1. Run the four dataset-processing scripts: Backbone_RAW_treatment.Rmd, Validation_GSE27110 .Rmd, Validation_GSE263058.Rmd and Validation_GSE271456_GSE280017.Rmd. These process independent inputs.
+1. Run the four dataset-processing scripts: Backbone_RAW_treatment.Rmd, Validation_GSE271101.Rmd, Validation_GSE263058.Rmd and Validation_GSE271456_GSE280017.Rmd. These process independent inputs.
 
 2. Run Validation_Summary.Rmd after the four dataset scripts have produced their respective mat_z.csv files within results/.
 
